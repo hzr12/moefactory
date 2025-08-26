@@ -9,8 +9,8 @@ import argparse
 
 from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, TrainDelayDataset
 from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor
-from c2net.context import prepare,upload_output
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, model_name, save_path):
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, model_name):
     """
     训练模型
     """
@@ -68,12 +68,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), f'{save_path}/{model_name}_best.pth')
+            torch.save(model.state_dict(), f'./model/{model_name}_best.pth')
             print(f'Saved best {model_name} model with val loss: {best_val_loss:.4f}')
     
     return model
 
-def train_traditional_models(X_train, y_train, X_val, y_val, save_path):
+def train_traditional_models(X_train, y_train, X_val, y_val):
     """
     训练传统机器学习模型
     """
@@ -94,7 +94,7 @@ def train_traditional_models(X_train, y_train, X_val, y_val, save_path):
         print(f"Random Forest Val MSE: {rf_mse:.4f}")
         
         # 保存随机森林模型
-        with open(f'{save_path}/random_forest_best.pkl', 'wb') as f:
+        with open('./model/random_forest_best.pkl', 'wb') as f:
             pickle.dump(rf_model, f)
         
         # 训练LightGBM模型
@@ -108,7 +108,7 @@ def train_traditional_models(X_train, y_train, X_val, y_val, save_path):
         print(f"LightGBM Val MSE: {lgb_mse:.4f}")
         
         # 保存LightGBM模型
-        with open(f'{save_path}/lightgbm_best.pkl', 'wb') as f:
+        with open('./model/lightgbm_best.pkl', 'wb') as f:
             pickle.dump(lgb_model, f)
             
     except ImportError as e:
@@ -116,9 +116,6 @@ def train_traditional_models(X_train, y_train, X_val, y_val, save_path):
         print("Skipping traditional ML model training...")
 
 def main():
-    c2net_context = prepare()
-    train_path = c2net_context.dataset_path+"/"+"train"
-    save_path = c2net_context.output_path
     # 创建必要的目录
     os.makedirs('./model', exist_ok=True)
     
@@ -128,7 +125,7 @@ def main():
     
     # 加载数据
     print("Loading training data...")
-    train_df = load_train_data(train_path)
+    train_df = load_train_data('./datasets/train')
     print(f"Loaded {len(train_df)} training samples")
     
     # 编码分类特征
@@ -150,14 +147,14 @@ def main():
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=5364)
     
     # 训练传统机器学习模型
-    train_traditional_models(X_train, y_train, X_val, y_val, save_path)
+    train_traditional_models(X_train, y_train, X_val, y_val)
     
     # 创建数据集和数据加载器
     train_dataset = TrainDelayDataset(X_train, y_train)
     val_dataset = TrainDelayDataset(X_val, y_val)
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=34, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=34, shuffle=False)
     
     # 模型参数
     input_dim = X_train.shape[1]
@@ -172,30 +169,30 @@ def main():
     # 训练集成模型
     print("Training Ensemble Model...")
     ensemble_model = EnsembleModel(input_dim=input_dim)
-    ensemble_optimizer = optim.Adam(ensemble_model.parameters(), lr=learning_rate,)
-    train_model(ensemble_model, train_loader, val_loader, criterion, ensemble_optimizer, num_epochs, device, "ensemble", save_path)
+    ensemble_optimizer = optim.Adam(ensemble_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    train_model(ensemble_model, train_loader, val_loader, criterion, ensemble_optimizer, num_epochs, device, "ensemble")
     
     # 训练Transformer模型
     print("Training Transformer Model...")
     transformer_model = TransformerPredictor(input_dim=input_dim)
-    transformer_optimizer = optim.Adam(transformer_model.parameters(), lr=learning_rate,)
-    train_model(transformer_model, train_loader, val_loader, criterion, transformer_optimizer, num_epochs, device, "transformer", save_path)
+    transformer_optimizer = optim.Adam(transformer_model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    train_model(transformer_model, train_loader, val_loader, criterion, transformer_optimizer, num_epochs, device, "transformer")
     
     # 训练LSTM模型
     print("Training LSTM Model...")
     lstm_model = LSTMPredictor(input_size=input_dim)
-    lstm_optimizer = optim.Adam(lstm_model.parameters(), lr=learning_rate,)
-    train_model(lstm_model, train_loader, val_loader, criterion, lstm_optimizer, num_epochs, device, "lstm", save_path)
+    lstm_optimizer = optim.Adam(lstm_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    train_model(lstm_model, train_loader, val_loader, criterion, lstm_optimizer, num_epochs, device, "lstm")
     
     # 训练Seq2Seq模型
     print("Training Seq2Seq Model...")
     seq2seq_model = Seq2SeqPredictor(input_size=input_dim)
-    seq2seq_optimizer = optim.Adam(seq2seq_model.parameters(), lr=learning_rate, )
-    train_model(seq2seq_model, train_loader, val_loader, criterion, seq2seq_optimizer, num_epochs, device, "seq2seq", save_path)
+    seq2seq_optimizer = optim.Adam(seq2seq_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    train_model(seq2seq_model, train_loader, val_loader, criterion, seq2seq_optimizer, num_epochs, device, "seq2seq")
     
     # 保存标签编码器
     import pickle
-    with open(f'{save_path}/label_encoder.pkl', 'wb') as f:
+    with open('./model/label_encoder.pkl', 'wb') as f:
         pickle.dump(label_encoder, f)
     
     print("Training completed!")
