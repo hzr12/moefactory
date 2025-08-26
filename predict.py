@@ -84,7 +84,7 @@ def main():
     
     # 加载测试数据
     print("Loading test data...")
-    test_file = './datasets/test/20250826_G339.csv'
+    test_file = './20250826_G339.csv'
     test_df = load_test_data(test_file)
     print(f"Loaded {len(test_df)} test samples")
     
