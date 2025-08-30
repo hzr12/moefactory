@@ -70,7 +70,25 @@ def extract_time_features(df, is_train=True):
         df['出发月份'] = 1
         df['出发日'] = 1
         df['出发星期'] = 0
-    
+
+    # 车站与时间段的交互
+    df['车站_小时交互'] = df['车站编码'] * df['出发小时']
+    df['车站_星期交互'] = df['车站编码'] * df['出发星期']
+
+    # 时间特征交互
+    df['小时_星期交互'] = df['出发小时'] * df['出发星期']
+
+    # 处理到达时间特征
+    if '到达时间' in df.columns and not df['到达时间'].isna().all():
+        arrival_time = df['到达时间'].str.split(':', expand=True)
+        df['到达小时'] = pd.to_numeric(arrival_time[0], errors='coerce').fillna(0).astype(int)
+        df['到达分钟'] = pd.to_numeric(arrival_time[1], errors='coerce').fillna(0).astype(int)
+        df['到达时间_小时'] = pd.to_datetime(df['到达时间'], format='%H:%M', errors='coerce').dt.hour.fillna(0)
+        df['到达时间_分钟'] = pd.to_datetime(df['到达时间'], format='%H:%M', errors='coerce').dt.minute.fillna(0)
+        df['到达时间_小时_分钟'] = df['到达时间_小时'] * df['到达时间_分钟']
+    else:
+        df['到达小时'] = 0
+
     return df
 
 def encode_categorical_features(train_df, test_df=None):
@@ -115,9 +133,8 @@ def prepare_train_data(train_df):
     """
     # 提取时间特征
     train_df = extract_time_features(train_df, is_train=True)
-    
     # 选择特征列
-    feature_columns = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码']
+    feature_columns = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码', '车站_小时交互', '车站_星期交互', '小时_星期交互', '到达小时', '到达分钟', '到达时间_小时', '到达时间_分钟', '到达时间_小时_分钟']
     X = train_df[feature_columns].values
     y = train_df['延误分钟'].fillna(0).values  # 处理目标值中的NaN
     
@@ -131,7 +148,7 @@ def prepare_test_data(test_df):
     test_df = extract_time_features(test_df, is_train=False)
     
     # 选择特征列
-    feature_columns = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码']
+    feature_columns = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码', '车站_小时交互', '车站_星期交互', '小时_星期交互', '到达小时', '到达分钟', '到达时间_小时', '到达时间_分钟', '到达时间_小时_分钟']
     X = test_df[feature_columns].values
     
     return X

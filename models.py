@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 
 class TransformerPredictor(nn.Module):
-    def __init__(self, input_dim=6, d_model=64, nhead=8, num_layers=5, dim_feedforward=64, dropout=0.1):
+    def __init__(self, input_dim=6, d_model=32, nhead=8, num_layers=5, dim_feedforward=128, dropout=0.1):
         super(TransformerPredictor, self).__init__()
         self.d_model = d_model
         self.input_dim = input_dim
@@ -75,7 +75,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class LSTMPredictor(nn.Module):
-    def __init__(self, input_size=6, hidden_size=64, num_layers=5, dropout=0.1):
+    def __init__(self, input_size=6, hidden_size=32, num_layers=5, dropout=0.1):
         super(LSTMPredictor, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -113,7 +113,7 @@ class LSTMPredictor(nn.Module):
         return output
 
 class Seq2SeqPredictor(nn.Module):
-    def __init__(self, input_size=6, hidden_size=64, num_layers=2, dropout=0.1):
+    def __init__(self, input_size=6, hidden_size=64, num_layers=2, dropout=0.2):
         super(Seq2SeqPredictor, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
