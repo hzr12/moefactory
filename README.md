@@ -1,6 +1,6 @@
 # 列车延误预测系统
 
-基于PyTorch和多种机器学习算法的列车延误预测系统，旨在提升列车运行调度效率和乘客服务质量。
+基于PyTorch和多种机器学习算法的列车延误预测系统
 
 ## 项目概述
 
@@ -41,26 +41,47 @@ pip install -r requirements.txt
 - numpy>=1.21.0
 - scikit-learn>=1.0.0
 - lightgbm>=3.3.0
+- xgboost>=1.5.0
+- catboost>=1.0.0
 - tqdm>=4.62.0
 
 ## 项目结构
 
 ```
 .
-├── data_preprocess.py        # 数据预处理模块
-├── models.py                 # 深度学习模型定义
-├── train.py                  # 模型训练主程序
-├── predict.py                # 模型预测主程序
-├── integrated_ensemble.py    # 集成模型
-├── train_integrated_ensemble.py  # 集成模型训练
-├── predict_integrated_ensemble.py  # 集成模型预测
-├── incremental_train.py      # 增量训练
-├── datasets/                 # 数据集目录
-│   ├── train/                # 训练数据
-│   └── test/                 # 测试数据
-├── model/                    # 模型保存目录
-└── predictions/              # 预测结果保存目录
+├── data_preprocess.py             # 数据预处理模块
+├── models.py                      # 深度学习模型定义
+├── train.py                       # 模型训练主程序
+├── predict.py                     # 模型预测主程序
+├── integrated_ensemble.py          # 集成模型
+├── train_integrated_ensemble.py   # 集成模型训练
+├── predict_integrated_ensemble.py # 集成模型预测
+├── incremental_train.py           # 增量训练
+├── datasets/                      # 数据集目录
+│   ├── train/                     # 训练数据
+│   └── test/                      # 测试数据
+├── model/                         # 模型保存目录
+└── predictions/                   # 预测结果保存目录
 ```
+
+## 数据格式
+
+### 训练数据格式
+训练数据应包含以下列：
+- 车次ID：列车唯一标识符
+- 车站名：车站名称
+- 出发日期：列车出发日期
+- 出发时间：列车出发时间 (HH:MM格式)
+- 到达时间：列车到达时间 (HH:MM格式)
+- 延误分钟：实际延误分钟数（目标变量）
+
+### 测试数据格式
+测试数据应包含以下列：
+- 车次ID：列车唯一标识符
+- 车站名：车站名称
+- 出发日期：列车出发日期
+- 出发时间：列车出发时间 (HH:MM格式)
+- 到达时间：列车到达时间 (HH:MM格式)
 
 ## 使用方法
 
@@ -94,6 +115,14 @@ python train_integrated_ensemble.py
 python predict_integrated_ensemble.py
 ```
 
+### 5. 增量训练
+
+```bash
+python incremental_train.py
+```
+
+增量训练允许在已有模型基础上使用新数据继续训练。
+
 ## 特征工程
 
 系统实现了丰富的特征工程，包括：
@@ -111,6 +140,8 @@ python predict_integrated_ensemble.py
 1. 简单平均：对所有模型预测结果进行平均
 2. 加权集成：根据模型在验证集上的表现动态分配权重
 
+集成模型会自动计算各子模型的权重，性能越好的模型获得越高的权重。
+
 ## 训练优化
 
 - 早停机制防止过拟合
@@ -126,6 +157,15 @@ python predict_integrated_ensemble.py
 - 出发日期
 - 出发时间
 - 预测延误分钟（整数）
+
+每个模型都会生成独立的预测结果文件，文件命名格式为：
+- 单模型预测：`prediction_results_{model_name}_{test_file_name}.csv`
+- 平均集成预测：`prediction_results_average_{test_file_name}.csv`
+- 动态权重集成预测：`prediction_results_integrated_ensemble_{test_file_name}.csv`
+
+## 性能监控
+
+训练过程中使用进度条显示训练进度，并实时显示训练和验证损失。模型会在验证损失改善时自动保存最佳权重。
 
 ## 许可证
 
