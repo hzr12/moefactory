@@ -24,8 +24,8 @@ def save_predictions(test_df, predictions, test_file_name):
     """
     保存集成模型的预测结果
     """
-    # 四舍五入为整数
-    model_predictions = np.round(predictions).astype(int)
+    # 保留2位小数
+    model_predictions = np.round(predictions, 2)
     
     # 创建结果DataFrame
     result_df = test_df[['车次ID', '车站名', '出发日期', '出发时间']].copy()

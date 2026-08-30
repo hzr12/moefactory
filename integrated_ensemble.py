@@ -6,35 +6,45 @@ import os
 from sklearn.metrics import mean_squared_error
 from data_preprocess import TrainDelayDataset
 from torch.utils.data import DataLoader
-from models import TransformerPredictor, LSTMPredictor, Seq2SeqPredictor
+from models import TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
+
+"""
+集成模型模块
+负责集成多种模型的预测结果，使用动态权重分配策略
+"""
 
 class IntegratedEnsembleModel:
     """
-    集成所有模型的综合集成模型类，包括传统机器学习模型和深度学习模型
-    使用动态权重分配策略
+    集成所有模型的综合集成模型类
+    包括传统机器学习模型和深度学习模型，使用动态权重分配策略
     """
     
     def __init__(self, input_dim=6):
         """
         初始化集成模型
+        
+        Args:
+            input_dim (int): 输入特征维度
         """
         # 深度学习模型
         self.transformer_model = TransformerPredictor(input_dim=input_dim)
         self.lstm_model = LSTMPredictor(input_size=input_dim)
         self.seq2seq_model = Seq2SeqPredictor(input_size=input_dim)
+        self.tft_model = TFT(input_dim=input_dim)
         self.dl_ensemble_model = None  # 深度学习集成模型
         
         # 传统机器学习模型
-        self.rf_model = None
-        self.lgb_model = None
-        self.xgb_model = None
-        self.cat_model = None
+        self.rf_model = None  # 随机森林模型
+        self.lgb_model = None  # LightGBM模型
+        self.xgb_model = None  # XGBoost模型
+        self.cat_model = None  # CatBoost模型
         
         # 模型权重
         self.weights = {
             'transformer': 1.0,
             'lstm': 1.0,
             'seq2seq': 1.0,
+            'tft': 1.0,
             'rf': 1.0,
             'lgb': 1.0,
             'xgb': 1.0,
@@ -47,6 +57,9 @@ class IntegratedEnsembleModel:
     def load_models(self, model_dir='./model'):
         """
         加载所有训练好的模型
+        
+        Args:
+            model_dir (str): 模型存储目录
         """
         # 加载深度学习模型
         try:
@@ -78,6 +91,16 @@ class IntegratedEnsembleModel:
             print("Successfully loaded Seq2Seq model")
         except Exception as e:
             print(f"Failed to load Seq2Seq model: {e}")
+            
+        try:
+            self.tft_model.load_state_dict(
+                torch.load(f'{model_dir}/tft_best.pth', map_location=self.device)
+            )
+            self.tft_model.to(self.device)
+            self.tft_model.eval()
+            print("Successfully loaded TFT model")
+        except Exception as e:
+            print(f"Failed to load TFT model: {e}")
             
         # 加载传统机器学习模型
         try:
@@ -111,6 +134,12 @@ class IntegratedEnsembleModel:
     def predict_dl_models(self, X):
         """
         使用深度学习模型进行预测
+        
+        Args:
+            X (numpy.ndarray): 输入特征
+            
+        Returns:
+            dict: 各深度学习模型的预测结果
         """
         # 创建数据加载器
         dataset = TrainDelayDataset(X, np.zeros(len(X)))  # 只需要输入，不需要标签
@@ -120,6 +149,7 @@ class IntegratedEnsembleModel:
         transformer_preds = []
         lstm_preds = []
         seq2seq_preds = []
+        tft_preds = []
         
         with torch.no_grad():
             for inputs, _ in dataloader:
@@ -151,16 +181,32 @@ class IntegratedEnsembleModel:
                     except Exception as e:
                         print(f"Error in Seq2Seq prediction: {e}")
                         seq2seq_preds.extend([0] * inputs.size(0))
+                
+                # TFT预测
+                if hasattr(self, 'tft_model') and self.tft_model is not None:
+                    try:
+                        pred = self.tft_model(inputs)
+                        tft_preds.extend(pred.cpu().numpy().flatten())
+                    except Exception as e:
+                        print(f"Error in TFT prediction: {e}")
+                        tft_preds.extend([0] * inputs.size(0))
         
         return {
             'transformer': np.array(transformer_preds),
             'lstm': np.array(lstm_preds),
-            'seq2seq': np.array(seq2seq_preds)
+            'seq2seq': np.array(seq2seq_preds),
+            'tft': np.array(tft_preds)
         }
     
     def predict_ml_models(self, X):
         """
         使用传统机器学习模型进行预测
+        
+        Args:
+            X (numpy.ndarray): 输入特征
+            
+        Returns:
+            dict: 各传统机器学习模型的预测结果
         """
         predictions = {}
         
@@ -201,6 +247,13 @@ class IntegratedEnsembleModel:
     def calculate_weights(self, X_val, y_val):
         """
         根据验证集表现动态计算模型权重
+        
+        Args:
+            X_val (numpy.ndarray): 验证集特征
+            y_val (numpy.ndarray): 验证集目标值
+            
+        Returns:
+            dict: 各模型的权重
         """
         print("Calculating dynamic weights based on validation performance...")
         
@@ -245,6 +298,12 @@ class IntegratedEnsembleModel:
     def predict(self, X):
         """
         使用集成模型进行预测
+        
+        Args:
+            X (numpy.ndarray): 输入特征
+            
+        Returns:
+            numpy.ndarray: 集成预测结果
         """
         # 获取深度学习模型预测
         dl_predictions = self.predict_dl_models(X)
@@ -278,6 +337,9 @@ class IntegratedEnsembleModel:
     def save_model_info(self, filepath):
         """
         保存模型信息（权重等）
+        
+        Args:
+            filepath (str): 保存文件路径
         """
         model_info = {
             'weights': self.weights
@@ -293,6 +355,12 @@ class IntegratedEnsembleModel:
     def load_model_info(self, filepath):
         """
         加载模型信息（权重等）
+        
+        Args:
+            filepath (str): 加载文件路径
+            
+        Returns:
+            bool: 加载是否成功
         """
         try:
             with open(filepath, 'rb') as f:

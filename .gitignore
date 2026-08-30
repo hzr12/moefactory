@@ -1,0 +1,5 @@
+datasets/*
+__pycache__/
+catboost_info/
+model/
+predictions/

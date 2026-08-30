@@ -9,13 +9,32 @@ import argparse
 from tqdm import tqdm
 
 from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, TrainDelayDataset
-from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor
-# base模型训练
+from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
+
+"""
+模型训练脚本
+负责训练各种预测模型，包括深度学习模型和传统机器学习模型
+"""
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, model_name,
                 patience=50):
     """
     训练模型，增加早停机制
+    
+    Args:
+        model (torch.nn.Module): 要训练的模型
+        train_loader (torch.utils.data.DataLoader): 训练数据加载器
+        val_loader (torch.utils.data.DataLoader): 验证数据加载器
+        criterion (torch.nn.Module): 损失函数
+        optimizer (torch.optim.Optimizer): 优化器
+        scheduler (torch.optim.lr_scheduler._LRScheduler): 学习率调度器
+        num_epochs (int): 训练轮数
+        device (torch.device): 训练设备
+        model_name (str): 模型名称
+        patience (int): 早停耐心值
+        
+    Returns:
+        torch.nn.Module: 训练后的模型
     """
     model.to(device)
     best_val_loss = float('inf')
@@ -110,6 +129,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 def train_traditional_models(X_train, y_train, X_val, y_val):
     """
     训练传统机器学习模型
+    
+    Args:
+        X_train (numpy.ndarray): 训练特征
+        y_train (numpy.ndarray): 训练目标值
+        X_val (numpy.ndarray): 验证特征
+        y_val (numpy.ndarray): 验证目标值
     """
     try:
         from sklearn.ensemble import RandomForestRegressor
@@ -201,6 +226,9 @@ def train_traditional_models(X_train, y_train, X_val, y_val):
         print("Skipping traditional ML model training...")
 
 def main():
+    """
+    主函数，负责整个训练流程
+    """
     # 创建必要的目录
     os.makedirs('./model', exist_ok=True)
     
@@ -243,7 +271,7 @@ def main():
     
     # 模型参数
     input_dim = X_train.shape[1]
-    num_epochs = 500  # 减少训练轮数
+    num_epochs = 500  # 训练轮数
     learning_rate = 0.001
     
     print(f"Input dimension: {input_dim}")
@@ -278,6 +306,13 @@ def main():
     seq2seq_optimizer = optim.Adam(seq2seq_model.parameters(), lr=learning_rate, weight_decay=1e-5)
     seq2seq_scheduler = optim.lr_scheduler.ReduceLROnPlateau(seq2seq_optimizer, mode='min', patience=10, factor=0.9)
     train_model(seq2seq_model, train_loader, val_loader, criterion, seq2seq_optimizer, seq2seq_scheduler, num_epochs, device, "seq2seq")
+    
+    # 训练TFT模型
+    print("Training TFT Model...")
+    tft_model = TFT(input_dim=input_dim)
+    tft_optimizer = optim.Adam(tft_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    tft_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tft_optimizer, mode='min', patience=10, factor=0.9)
+    train_model(tft_model, train_loader, val_loader, criterion, tft_optimizer, tft_scheduler, num_epochs, device, "tft")
     
     # 保存标签编码器
     import pickle

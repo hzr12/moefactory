@@ -7,11 +7,24 @@ import argparse
 import glob
 
 from data_preprocess import load_test_data, encode_categorical_features, prepare_test_data, load_train_data
-from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor
+from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
+
+"""
+模型预测脚本
+负责使用训练好的模型进行预测并保存结果
+"""
 
 def load_trained_model(model, model_path, device):
     """
     加载训练好的模型
+    
+    Args:
+        model (torch.nn.Module): 模型实例
+        model_path (str): 模型文件路径
+        device (torch.device): 运行设备
+        
+    Returns:
+        torch.nn.Module or None: 加载成功返回模型，失败返回None
     """
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -26,6 +39,12 @@ def load_trained_model(model, model_path, device):
 def load_traditional_model(model_path):
     """
     加载传统机器学习模型
+    
+    Args:
+        model_path (str): 模型文件路径
+        
+    Returns:
+        object or None: 加载成功返回模型，失败返回None
     """
     try:
         with open(model_path, 'rb') as f:
@@ -39,6 +58,14 @@ def load_traditional_model(model_path):
 def predict_with_model(model, test_loader, device):
     """
     使用深度学习模型进行预测
+    
+    Args:
+        model (torch.nn.Module): 深度学习模型
+        test_loader (torch.utils.data.DataLoader): 测试数据加载器
+        device (torch.device): 运行设备
+        
+    Returns:
+        numpy.ndarray: 预测结果数组
     """
     predictions = []
     with torch.no_grad():
@@ -51,6 +78,13 @@ def predict_with_model(model, test_loader, device):
 def predict_with_traditional_model(model, X_test):
     """
     使用传统机器学习模型进行预测
+    
+    Args:
+        model: 传统机器学习模型
+        X_test (numpy.ndarray): 测试特征
+        
+    Returns:
+        numpy.ndarray: 预测结果数组
     """
     try:
         predictions = model.predict(X_test)
@@ -62,9 +96,15 @@ def predict_with_traditional_model(model, X_test):
 def save_predictions(test_df, predictions, model_name, test_file_name):
     """
     保存单个模型的预测结果
+    
+    Args:
+        test_df (pandas.DataFrame): 测试数据
+        predictions (numpy.ndarray): 预测结果
+        model_name (str): 模型名称
+        test_file_name (str): 测试文件名
     """
-    # 四舍五入为整数
-    model_predictions = np.round(predictions).astype(int)
+    # 保留2位小数
+    model_predictions = np.round(predictions, 2)
     
     # 创建结果DataFrame
     result_df = test_df[['车次ID', '车站名', '出发日期', '出发时间']].copy()
@@ -78,6 +118,11 @@ def save_predictions(test_df, predictions, model_name, test_file_name):
 def save_average_predictions(test_df, all_predictions, test_file_name):
     """
     保存所有模型预测结果的平均值
+    
+    Args:
+        test_df (pandas.DataFrame): 测试数据
+        all_predictions (dict): 所有模型的预测结果
+        test_file_name (str): 测试文件名
     """
     if not all_predictions:
         print("No predictions to average")
@@ -87,8 +132,8 @@ def save_average_predictions(test_df, all_predictions, test_file_name):
     predictions_array = np.array(list(all_predictions.values()))
     average_predictions = np.mean(predictions_array, axis=0)
     
-    # 四舍五入为整数
-    avg_predictions = np.round(average_predictions).astype(int)
+    # 保留2位小数
+    avg_predictions = np.round(average_predictions, 2)
     
     # 创建结果DataFrame
     result_df = test_df[['车次ID', '车站名', '出发日期', '出发时间']].copy()
@@ -102,6 +147,14 @@ def save_average_predictions(test_df, all_predictions, test_file_name):
 def process_single_file(test_file, train_df, device):
     """
     处理单个测试文件
+    
+    Args:
+        test_file (str): 测试文件路径
+        train_df (pandas.DataFrame): 训练数据
+        device (torch.device): 运行设备
+        
+    Returns:
+        dict: 所有模型的预测结果
     """
     print(f"Loading test data from {test_file}...")
     test_df = load_test_data(test_file)
@@ -233,12 +286,28 @@ def process_single_file(test_file, train_df, device):
     else:
         print(f"Seq2Seq model not found at {seq2seq_model_path}")
     
+    # TFT模型预测
+    print("Predicting with TFT Model...")
+    tft_model = TFT(input_dim=input_dim)
+    tft_model_path = './model/tft_best.pth'
+    if os.path.exists(tft_model_path):
+        tft_model = load_trained_model(tft_model, tft_model_path, device)
+        if tft_model is not None:
+            tft_preds = predict_with_model(tft_model, test_loader, device)
+            predictions['tft'] = tft_preds
+            save_predictions(test_df, tft_preds, 'tft', test_file_name)
+    else:
+        print(f"TFT model not found at {tft_model_path}")
+    
     # 保存所有模型预测结果的平均值
     save_average_predictions(test_df, predictions, test_file_name)
     
     return predictions
 
 def main():
+    """
+    主函数，负责整个预测流程
+    """
     # 创建必要的目录
     os.makedirs('./predictions', exist_ok=True)
     
