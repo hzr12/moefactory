@@ -314,11 +314,15 @@ def main():
     tft_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tft_optimizer, mode='min', patience=10, factor=0.9)
     train_model(tft_model, train_loader, val_loader, criterion, tft_optimizer, tft_scheduler, num_epochs, device, "tft")
     
-    # 保存标签编码器
+    # 保存标签编码器（车站 + 车次）
     import pickle
     with open('./model/label_encoder.pkl', 'wb') as f:
         pickle.dump(label_encoder, f)
-    
+    encoders = train_df.attrs.get('label_encoders') or {}
+    if encoders.get('train') is not None:
+        with open('./model/train_label_encoder.pkl', 'wb') as f:
+            pickle.dump(encoders['train'], f)
+
     print("Training completed!")
 
 if __name__ == "__main__":

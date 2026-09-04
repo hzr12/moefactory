@@ -297,6 +297,23 @@ def main():
         with open('./model/label_encoder.pkl', 'wb') as f:
             pickle.dump(label_encoder, f)
 
+    # 车次编码（新数据格式新增特征）：优先用训练时保存的车次编码器，未知车次记 0
+    if '车次编码' not in incremental_train_df.columns:
+        le_train = None
+        train_le_path = './model/train_label_encoder.pkl'
+        if os.path.exists(train_le_path):
+            try:
+                with open(train_le_path, 'rb') as f:
+                    le_train = pickle.load(f)
+            except Exception:
+                le_train = None
+        if le_train is not None:
+            mapping = {label: idx for idx, label in enumerate(le_train.classes_)}
+            incremental_train_df['车次编码'] = [mapping.get(str(v), 0)
+                                              for v in incremental_train_df['车次ID'].astype(str)]
+        else:
+            incremental_train_df['车次编码'] = 0
+
     # 准备训练数据
     X, y = prepare_train_data(incremental_train_df)
 

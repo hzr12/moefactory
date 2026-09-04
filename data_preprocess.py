@@ -11,6 +11,27 @@ from datetime import datetime
 负责数据加载、特征提取和预处理
 """
 
+# 数值天气特征（20 列新数据格式）。“天气情况”为文本冗余列、“距离”在 G339 历史数据中缺失，均不作为特征。
+WEATHER_FEATURES = ['当日最高温', '当日最低温', '当日降水量', '当日降雨量', '当日降雪量',
+                    '降水小时数', '最大风速', '最大阵风', '平均云量', '平均相对湿度', '天气代码']
+
+# 基础时间/车站特征
+BASE_FEATURES = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码',
+                 '车站_小时交互', '车站_星期交互', '小时_星期交互', '到达小时', '到达分钟',
+                 '到达时间_小时', '到达时间_分钟', '到达时间_小时_分钟']
+
+
+def _feature_columns(df):
+    """最终特征列 = 基础特征 + 车次编码 + 天气特征。"""
+    return list(BASE_FEATURES) + ['车次编码'] + list(WEATHER_FEATURES)
+
+
+def _safe_transform(le, values):
+    """逐值转换，未知标签记为 0（与原整列 try/except 行为一致但更精细）。"""
+    mapping = {label: idx for idx, label in enumerate(le.classes_)}
+    return [mapping.get(v, 0) for v in values]
+
+
 class TrainDelayDataset(Dataset):
     """
     列车延误数据集类
@@ -144,46 +165,54 @@ def extract_time_features(df, is_train=True):
 
 def encode_categorical_features(train_df, test_df=None):
     """
-    编码分类特征
-    
+    编码分类特征（车站 + 车次）
+
     Args:
         train_df (pandas.DataFrame): 训练数据
         test_df (pandas.DataFrame, optional): 测试数据，默认为None
-        
+
     Returns:
         tuple: 如果提供了测试数据，返回(train_df, test_df, le_station)；否则返回(train_df, le_station)
     """
-    # 处理车站名
     le_station = LabelEncoder()
-    
+    le_train = LabelEncoder()
+
+    train_df['车次ID'] = train_df['车次ID'].astype(str)
+
     if test_df is not None:
+        test_df['车次ID'] = test_df['车次ID'].astype(str)
         # 合并训练和测试数据进行编码，确保所有可能的类别都被覆盖
-        all_stations = pd.concat([train_df['车站名'], test_df['车站名']], ignore_index=True)
-        le_station.fit(all_stations)
-        
-        # 对训练数据编码
-        try:
-            train_df['车站编码'] = le_station.transform(train_df['车站名'])
-        except ValueError:
-            # 处理训练数据中可能存在的未知标签
-            train_df['车站编码'] = 0
-        
-        # 对测试数据编码
-        try:
-            test_df['车站编码'] = le_station.transform(test_df['车站名'])
-        except ValueError:
-            # 处理测试数据中可能存在的未知标签
-            test_df['车站编码'] = 0
-            
+        le_station.fit(pd.concat([train_df['车站名'], test_df['车站名']], ignore_index=True))
+        le_train.fit(pd.concat([train_df['车次ID'], test_df['车次ID']], ignore_index=True))
+
+        train_df['车站编码'] = _safe_transform(le_station, train_df['车站名'])
+        test_df['车站编码'] = _safe_transform(le_station, test_df['车站名'])
+        train_df['车次编码'] = _safe_transform(le_train, train_df['车次ID'])
+        test_df['车次编码'] = _safe_transform(le_train, test_df['车次ID'])
+
+        # 编码器挂在 attrs 上，训练脚本可直接取用保存（保持原有返回签名不变）
+        train_df.attrs['label_encoders'] = {'station': le_station, 'train': le_train}
         return train_df, test_df, le_station
     else:
         # 仅处理训练数据
         le_station.fit(train_df['车站名'])
-        try:
-            train_df['车站编码'] = le_station.transform(train_df['车站名'])
-        except ValueError:
-            train_df['车站编码'] = 0
+        le_train.fit(train_df['车次ID'])
+        train_df['车站编码'] = _safe_transform(le_station, train_df['车站名'])
+        train_df['车次编码'] = _safe_transform(le_train, train_df['车次ID'])
+        train_df.attrs['label_encoders'] = {'station': le_station, 'train': le_train}
         return train_df, le_station
+
+def _coerce_weather_numeric(df):
+    """把天气特征统一为数值（空串/缺失→NaN，由调用方 nan_to_num 处理）；旧数据缺列时补 NaN。"""
+    for c in WEATHER_FEATURES:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        else:
+            df[c] = np.nan
+    if '车次编码' not in df.columns:
+        df['车次编码'] = 0
+    return df
+
 
 def prepare_train_data(train_df):
     """
@@ -197,10 +226,11 @@ def prepare_train_data(train_df):
     """
     # 提取时间特征
     train_df = extract_time_features(train_df, is_train=True)
-    # 选择特征列
-    feature_columns = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码', '车站_小时交互', '车站_星期交互', '小时_星期交互', '到达小时', '到达分钟', '到达时间_小时', '到达时间_分钟', '到达时间_小时_分钟']
-    X = train_df[feature_columns].values
-    y = train_df['延误分钟'].fillna(0).values  # 处理目标值中的NaN
+    # 天气特征统一为数值
+    train_df = _coerce_weather_numeric(train_df)
+    # 选择特征列：基础特征 + 车次编码 + 天气特征
+    X = train_df[_feature_columns(train_df)].values.astype(float)
+    y = pd.to_numeric(train_df['延误分钟'], errors='coerce').fillna(0).values  # 处理目标值中的NaN
     
     return X, y
 
@@ -217,8 +247,10 @@ def prepare_test_data(test_df):
     # 提取时间特征
     test_df = extract_time_features(test_df, is_train=False)
     
-    # 选择特征列
-    feature_columns = ['出发小时', '出发分钟', '出发月份', '出发日', '出发星期', '车站编码', '车站_小时交互', '车站_星期交互', '小时_星期交互', '到达小时', '到达分钟', '到达时间_小时', '到达时间_分钟', '到达时间_小时_分钟']
-    X = test_df[feature_columns].values
+    # 天气特征统一为数值
+    test_df = _coerce_weather_numeric(test_df)
+
+    # 选择特征列：基础特征 + 车次编码 + 天气特征
+    X = test_df[_feature_columns(test_df)].values.astype(float)
     
     return X
