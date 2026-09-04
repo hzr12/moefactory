@@ -151,6 +151,7 @@ def train_traditional_models(X_train, y_train, X_val, y_val):
             max_depth=10,
             min_samples_split=5,
             min_samples_leaf=2,
+            n_jobs=-1,
             random_state=3461
         )
         rf_model.fit(X_train, y_train)
