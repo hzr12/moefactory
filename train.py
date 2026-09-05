@@ -8,7 +8,7 @@ import os
 import argparse
 from tqdm import tqdm
 
-from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, TrainDelayDataset
+from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, TrainDelayDataset, split_by_date
 from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
 
 """
@@ -108,7 +108,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         epoch_pbar.set_postfix({
             'loss': f'{avg_train_loss:.4f}',
             'val_loss': f'{avg_val_loss:.4f}',
-            'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+            'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
         })
 
         # 早停机制
@@ -147,7 +147,7 @@ def train_traditional_models(X_train, y_train, X_val, y_val):
         # 训练随机森林模型
         print("Training Random Forest Model...")
         rf_model = RandomForestRegressor(
-            n_estimators=10000,
+            n_estimators=1000,
             max_depth=10,
             min_samples_split=5,
             min_samples_leaf=2,
@@ -168,7 +168,7 @@ def train_traditional_models(X_train, y_train, X_val, y_val):
         # 训练LightGBM模型
         print("Training LightGBM Model...")
         lgb_model = LGBMRegressor(
-            num_leaves=127,
+            num_leaves=63,
             learning_rate=0.01,
             n_estimators=500
         )
@@ -256,9 +256,10 @@ def main():
     X = np.nan_to_num(X, nan=0.0)
     y = np.nan_to_num(y, nan=0.0)
     
-    # 划分训练集和验证集
-    from sklearn.model_selection import train_test_split
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=5364)
+    # 按“到达日期”分组留出验证集：避免同一天的行分到两侧，导致按天常量的天气特征变成日期指纹
+    X_train, X_val, y_train, y_val, val_start, val_end = split_by_date(train_df, X, y, val_ratio=0.1)
+    print(f"训练集: {len(X_train)} 行 / 验证集: {len(X_val)} 行")
+    print(f"验证集日期范围: {str(val_start)[:10]} ~ {str(val_end)[:10]}")
     
     # 训练传统机器学习模型
     train_traditional_models(X_train, y_train, X_val, y_val)
@@ -284,35 +285,35 @@ def main():
     print("Training Ensemble Model...")
     ensemble_model = EnsembleModel(input_dim=input_dim)
     ensemble_optimizer = optim.Adam(ensemble_model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    ensemble_scheduler = optim.lr_scheduler.ReduceLROnPlateau(ensemble_optimizer, mode='min', patience=10, factor=0.9)
+    ensemble_scheduler = optim.lr_scheduler.ReduceLROnPlateau(ensemble_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(ensemble_model, train_loader, val_loader, criterion, ensemble_optimizer, ensemble_scheduler, num_epochs, device, "ensemble")
     
     # 训练Transformer模型
     print("Training Transformer Model...")
     transformer_model = TransformerPredictor(input_dim=input_dim)
     transformer_optimizer = optim.Adam(transformer_model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    transformer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(transformer_optimizer, mode='min', patience=10, factor=0.9)
+    transformer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(transformer_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(transformer_model, train_loader, val_loader, criterion, transformer_optimizer, transformer_scheduler, num_epochs, device, "transformer")
     
     # 训练LSTM模型
     print("Training LSTM Model...")
     lstm_model = LSTMPredictor(input_size=input_dim)
     lstm_optimizer = optim.Adam(lstm_model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    lstm_scheduler = optim.lr_scheduler.ReduceLROnPlateau(lstm_optimizer, mode='min', patience=10, factor=0.9)
+    lstm_scheduler = optim.lr_scheduler.ReduceLROnPlateau(lstm_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(lstm_model, train_loader, val_loader, criterion, lstm_optimizer, lstm_scheduler, num_epochs, device, "lstm")
     
     # 训练Seq2Seq模型
     print("Training Seq2Seq Model...")
     seq2seq_model = Seq2SeqPredictor(input_size=input_dim)
     seq2seq_optimizer = optim.Adam(seq2seq_model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    seq2seq_scheduler = optim.lr_scheduler.ReduceLROnPlateau(seq2seq_optimizer, mode='min', patience=10, factor=0.9)
+    seq2seq_scheduler = optim.lr_scheduler.ReduceLROnPlateau(seq2seq_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(seq2seq_model, train_loader, val_loader, criterion, seq2seq_optimizer, seq2seq_scheduler, num_epochs, device, "seq2seq")
     
     # 训练TFT模型
     print("Training TFT Model...")
     tft_model = TFT(input_dim=input_dim)
     tft_optimizer = optim.Adam(tft_model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    tft_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tft_optimizer, mode='min', patience=10, factor=0.9)
+    tft_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tft_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(tft_model, train_loader, val_loader, criterion, tft_optimizer, tft_scheduler, num_epochs, device, "tft")
     
     # 保存标签编码器（车站 + 车次）

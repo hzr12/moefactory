@@ -4,7 +4,7 @@ import os
 import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data
+from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, split_by_date
 from integrated_ensemble import IntegratedEnsembleModel
 
 def train_integrated_ensemble():
@@ -35,8 +35,9 @@ def train_integrated_ensemble():
     X = np.nan_to_num(X, nan=0.0)
     y = np.nan_to_num(y, nan=0.0)
     
-    # 划分训练集和验证集
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=5364)
+    # 按“到达日期”分组留出验证集（与 train.py 一致，避免日期泄漏）
+    X_train, X_val, y_train, y_val, val_start, val_end = split_by_date(train_df, X, y, val_ratio=0.2)
+    print(f"验证集日期范围: {str(val_start)[:10]} ~ {str(val_end)[:10]}")
     
     print(f"Train set size: {X_train.shape[0]}")
     print(f"Validation set size: {X_val.shape[0]}")

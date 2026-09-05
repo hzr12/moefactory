@@ -214,6 +214,21 @@ def _coerce_weather_numeric(df):
     return df
 
 
+def split_by_date(df, X, y, val_ratio=0.1, date_col='到达日期'):
+    """按日期分组留出验证集：取日期排序后最后 val_ratio 比例的日期作为验证集。
+
+    同一天的所有行要么全在训练、要么全在验证。随机行划分会把同一天的行分到两侧，
+    使“按天常量”的天气特征沦为一个日期指纹，评估结果虚高，也不符合“预测一个全新日期”的真实场景。
+    """
+    dates = pd.to_datetime(df[date_col], errors='coerce')
+    unique_dates = pd.DatetimeIndex(sorted(dates.dropna().unique()))
+    n_val_dates = max(1, int(round(len(unique_dates) * val_ratio)))
+    val_dates = unique_dates[-n_val_dates:]
+    is_val = dates.isin(val_dates).values
+
+    return X[~is_val], X[is_val], y[~is_val], y[is_val], val_dates[0], val_dates[-1]
+
+
 def prepare_train_data(train_df):
     """
     准备训练数据
