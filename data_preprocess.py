@@ -21,9 +21,14 @@ BASE_FEATURES = ['出发小时', '出发分钟', '出发月份', '出发日', '�
                  '到达时间_小时', '到达时间_分钟', '到达时间_小时_分钟']
 
 
+# 行程特征（按“同一车次 + 同一到达日期”的行程分组、沿停站顺序计算）
+JOURNEY_FEATURES = ['站序', '行程站点数', '站序占比', '是否始发站', '是否终到站',
+                    '前一站延误分钟', '累计延误分钟', '停站时长', '站间运行时间']
+
+
 def _feature_columns(df):
-    """最终特征列 = 基础特征 + 车次编码 + 天气特征。"""
-    return list(BASE_FEATURES) + ['车次编码'] + list(WEATHER_FEATURES)
+    """最终特征列 = 基础特征 + 车次编码 + 行程特征 + 天气特征。"""
+    return list(BASE_FEATURES) + ['车次编码'] + list(JOURNEY_FEATURES) + list(WEATHER_FEATURES)
 
 
 def _safe_transform(le, values):
@@ -202,6 +207,61 @@ def encode_categorical_features(train_df, test_df=None):
         train_df.attrs['label_encoders'] = {'station': le_station, 'train': le_train}
         return train_df, le_station
 
+def _time_to_minutes(series):
+    """把 'HH:MM' 形式的时间列转成当日分钟数（无法解析返回 NaN）。"""
+    parts = series.astype(str).str.strip().str.split(':', expand=True)
+    hours = pd.to_numeric(parts[0], errors='coerce')
+    minutes = pd.to_numeric(parts[1], errors='coerce')
+    return hours * 60 + minutes
+
+
+def add_journey_features(df):
+    """按行程（车次 + 到达日期）构造沿停站顺序的特征。
+
+    每个 CSV 是一趟车按停站顺序排列的行，因此行号即站序。新增：
+      站序 / 行程站点数 / 站序占比 / 是否始发站 / 是否终到站
+      前一站延误分钟、累计延误分钟、停站时长、站间运行时间
+
+    注意：前一站延误与累计延误取自同一行程内其它站的“延误分钟”，仅在“已知前序站实际延误”
+    的场景可用（实时滚动预测、事后分析）。若要做纯发车前预测，应剔除这两列。
+    """
+    df = df.copy()
+    day = pd.to_datetime(df['到达日期'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('unknown')
+    df['_journey_id'] = df['车次ID'].astype(str) + '_' + day
+
+    df['站序'] = df.groupby('_journey_id', sort=False).cumcount() + 1
+    df['行程站点数'] = df.groupby('_journey_id', sort=False)['站序'].transform('max')
+    df['是否始发站'] = (df['站序'] == 1).astype(int)
+    df['是否终到站'] = (df['站序'] == df['行程站点数']).astype(int)
+    df['站序占比'] = df['站序'] / df['行程站点数'].replace(0, np.nan)
+
+    delay = pd.to_numeric(df['延误分钟'], errors='coerce').fillna(0.0)
+    df['前一站延误分钟'] = delay.groupby(df['_journey_id'], sort=False).shift(1).fillna(0.0)
+    # 必须减掉当前站自身，否则等于把标签直接作为特征（目标泄漏）
+    df['累计延误分钟'] = delay.groupby(df['_journey_id'], sort=False).cumsum() - delay
+
+    arrive = _time_to_minutes(df['到达时间'])
+    depart = _time_to_minutes(df['出发时间'])
+    dwell = depart - arrive
+    df['停站时长'] = dwell.where(dwell >= 0, dwell + 1440).fillna(0.0)  # 跨零点修正
+
+    prev_depart = depart.groupby(df['_journey_id'], sort=False).shift(1)
+    run = arrive - prev_depart
+    df['站间运行时间'] = run.where(run >= 0, run + 1440).fillna(0.0)
+    return df
+
+
+def _build_feature_frame(df):
+    """统一的特征构造流程：行程特征 -> 时间特征 -> 数值化。"""
+    df = add_journey_features(df)
+    df = extract_time_features(df)
+    df = _coerce_weather_numeric(df)
+    for c in JOURNEY_FEATURES:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
+
+
 def _coerce_weather_numeric(df):
     """把天气特征统一为数值（空串/缺失→NaN，由调用方 nan_to_num 处理）；旧数据缺列时补 NaN。"""
     for c in WEATHER_FEATURES:
@@ -239,11 +299,9 @@ def prepare_train_data(train_df):
     Returns:
         tuple: (特征矩阵X, 目标值y)
     """
-    # 提取时间特征
-    train_df = extract_time_features(train_df, is_train=True)
-    # 天气特征统一为数值
-    train_df = _coerce_weather_numeric(train_df)
-    # 选择特征列：基础特征 + 车次编码 + 天气特征
+    # 构造全部特征（行程特征 + 时间特征 + 天气数值化）
+    train_df = _build_feature_frame(train_df)
+    # 选择特征列：基础特征 + 车次编码 + 行程特征 + 天气特征
     X = train_df[_feature_columns(train_df)].values.astype(float)
     y = pd.to_numeric(train_df['延误分钟'], errors='coerce').fillna(0).values  # 处理目标值中的NaN
     
@@ -259,13 +317,74 @@ def prepare_test_data(test_df):
     Returns:
         numpy.ndarray: 特征矩阵X
     """
-    # 提取时间特征
-    test_df = extract_time_features(test_df, is_train=False)
-    
-    # 天气特征统一为数值
-    test_df = _coerce_weather_numeric(test_df)
+    # 构造全部特征（行程特征 + 时间特征 + 天气数值化）
+    test_df = _build_feature_frame(test_df)
 
-    # 选择特征列：基础特征 + 车次编码 + 天气特征
+    # 选择特征列：基础特征 + 车次编码 + 行程特征 + 天气特征
     X = test_df[_feature_columns(test_df)].values.astype(float)
     
     return X
+
+
+def prepare_sequence_data(df, max_len=None):
+    """把按行排列的停站记录重组成“行程序列”张量，供 LSTM/Transformer/TFT 使用。
+
+    一趟车（车次ID + 到达日期）的沿途各站构成一个序列，站序即时间步，
+    这样循环/注意力机制才真正作用于时序结构（此前是 seq_len=1，等于空转）。
+
+    返回 dict:
+      X: (n_journeys, max_len, n_features) float32
+      y: (n_journeys, max_len) float32
+      lengths: (n_journeys,) 每个行程的真实站点数
+      row_pos: (n_journeys, max_len) 每个时间步对应的原始行位置（padding 位为 -1）
+      dates: (n_journeys,) 每个行程的日期，便于按日期分组划分
+    """
+    fdf = _build_feature_frame(df).reset_index(drop=True)
+    cols = _feature_columns(fdf)
+    values = np.nan_to_num(fdf[cols].values.astype(float)).astype(np.float32)
+    targets = pd.to_numeric(fdf['延误分钟'], errors='coerce').fillna(0).values.astype(np.float32)
+
+    groups = [np.asarray(idx, dtype=int)
+              for _, idx in fdf.groupby('_journey_id', sort=False).groups.items()]
+    lengths = np.array([len(g) for g in groups], dtype=np.int64)
+    max_steps = int(lengths.max()) if max_len is None else int(max_len)
+    n, d = len(groups), values.shape[1]
+
+    X = np.zeros((n, max_steps, d), dtype=np.float32)
+    y = np.zeros((n, max_steps), dtype=np.float32)
+    row_pos = np.full((n, max_steps), -1, dtype=np.int64)
+    dates = []
+    for i, g in enumerate(groups):
+        k = min(len(g), max_steps)
+        X[i, :k] = values[g[:k]]
+        y[i, :k] = targets[g[:k]]
+        row_pos[i, :k] = g[:k]
+        dates.append(fdf['到达日期'].iloc[g[0]])
+
+    return {'X': X, 'y': y, 'lengths': lengths, 'row_pos': row_pos,
+            'dates': pd.to_datetime(pd.Series(dates), errors='coerce').values}
+
+
+def split_sequence_by_date(seq, val_ratio=0.1):
+    """按日期分组切分序列数据：取日期排序后最后 val_ratio 比例的日期作为验证集。"""
+    dates = pd.to_datetime(pd.Series(seq['dates']), errors='coerce')
+    unique_dates = pd.DatetimeIndex(dates.dropna().unique()).sort_values()
+    n_val_dates = max(1, int(round(len(unique_dates) * val_ratio)))
+    val_dates = unique_dates[-n_val_dates:]
+    is_val = dates.isin(val_dates).values
+
+    def _take(mask):
+        return {'X': seq['X'][mask], 'y': seq['y'][mask], 'lengths': seq['lengths'][mask],
+                'row_pos': seq['row_pos'][mask], 'dates': seq['dates'][mask]}
+
+    return _take(~is_val), _take(is_val), val_dates[0], val_dates[-1]
+
+
+def flatten_sequence_predictions(preds, seq):
+    """把 (n_journeys, max_len) 的序列预测还原成按原始行顺序排列的一维数组。"""
+    preds = np.asarray(preds).reshape(-1)
+    row_pos = np.asarray(seq['row_pos']).reshape(-1)
+    mask = row_pos >= 0
+    out = np.zeros(int(mask.sum()), dtype=float)
+    out[row_pos[mask]] = preds[mask]
+    return out

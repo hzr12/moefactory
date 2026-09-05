@@ -52,7 +52,7 @@ class TransformerPredictor(nn.Module):
             nn.Linear(32, 1)  # 输出单个预测值
         )
         
-    def forward(self, src):
+    def forward(self, src, lengths=None):
         """
         前向传播函数
         
@@ -60,7 +60,7 @@ class TransformerPredictor(nn.Module):
             src (torch.Tensor): 输入张量，形状为 (batch_size, features) 或 (batch_size, seq_len, features)
             
         Returns:
-            torch.Tensor: 预测结果，形状为 (batch_size, 1)
+            torch.Tensor: 预测结果，形状为 (batch_size, seq_len)，seq_len 为行程站点数
         """
         # 检查输入维度
         if src.dim() == 2:
@@ -76,13 +76,17 @@ class TransformerPredictor(nn.Module):
         src = self.pos_encoder(src)
         
         # Transformer编码
-        output = self.transformer_encoder(src)
+        # 构造 padding mask，避免自注意力看到补零的无效站点
+        src_key_padding_mask = None
+        if lengths is not None:
+            src_key_padding_mask = torch.arange(src.size(1), device=src.device)[None, :] >= lengths.to(src.device)[:, None]
+        output = self.transformer_encoder(src, src_key_padding_mask=src_key_padding_mask)
         
         # 全局平均池化，将序列维度压缩
-        output = output.mean(dim=1)
+        output = output  # 逐站点输出，不再全局池化
         
         # 输出层
-        output = self.output_layer(output)
+        output = self.output_layer(output).squeeze(-1)
         return output
 
 class PositionalEncoding(nn.Module):
@@ -111,7 +115,7 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)  # 添加批处理维度
         self.register_buffer('pe', pe)  # 注册为缓冲区，不参与参数更新
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         前向传播函数
         
@@ -158,7 +162,7 @@ class LSTMPredictor(nn.Module):
         # 输出层
         self.fc = nn.Linear(hidden_size, 1)
         
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         前向传播函数
         
@@ -166,7 +170,7 @@ class LSTMPredictor(nn.Module):
             x (torch.Tensor): 输入张量，形状为 (batch_size, features) 或 (batch_size, seq_len, features)
             
         Returns:
-            torch.Tensor: 预测结果，形状为 (batch_size, 1)
+            torch.Tensor: 预测结果，形状为 (batch_size, seq_len)，seq_len 为行程站点数
         """
         # 检查输入维度
         if x.dim() == 2:
@@ -176,14 +180,22 @@ class LSTMPredictor(nn.Module):
             raise ValueError(f"Expected 2D or 3D input, but got {x.dim()}D")
         
         # LSTM前向传播
-        lstm_out, _ = self.lstm(x)
+        if lengths is not None:
+            seq_len = x.size(1)
+            packed = torch.nn.utils.rnn.pack_padded_sequence(
+                x, lengths.detach().cpu(), batch_first=True, enforce_sorted=False)
+            packed_out, _ = self.lstm(packed)
+            lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
+                packed_out, batch_first=True, total_length=seq_len)
+        else:
+            lstm_out, _ = self.lstm(x)
         
         # 取最后一个时间步的输出
-        output = lstm_out[:, -1, :]
+        output = lstm_out  # 逐站点输出
         
         # 应用dropout和全连接层
         output = self.dropout(output)
-        output = self.fc(output)
+        output = self.fc(output).squeeze(-1)
         
         return output
 
@@ -233,7 +245,7 @@ class Seq2SeqPredictor(nn.Module):
             nn.Linear(32, 1)
         )
         
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         前向传播函数
         
@@ -241,7 +253,7 @@ class Seq2SeqPredictor(nn.Module):
             x (torch.Tensor): 输入张量，形状为 (batch_size, features) 或 (batch_size, seq_len, features)
             
         Returns:
-            torch.Tensor: 预测结果，形状为 (batch_size, 1)
+            torch.Tensor: 预测结果，形状为 (batch_size, seq_len)，seq_len 为行程站点数
         """
         # 检查输入维度
         if x.dim() == 2:
@@ -251,16 +263,21 @@ class Seq2SeqPredictor(nn.Module):
             raise ValueError(f"Expected 2D or 3D input, but got {x.dim()}D")
         
         # 编码器，获取上下文向量
-        _, (hidden, cell) = self.encoder(x)
+        if lengths is not None:
+            packed = torch.nn.utils.rnn.pack_padded_sequence(
+                x, lengths.detach().cpu(), batch_first=True, enforce_sorted=False)
+            _, (hidden, cell) = self.encoder(packed)
+        else:
+            _, (hidden, cell) = self.encoder(x)
         
         # 解码器，使用编码器的上下文向量进行解码
         decoder_output, _ = self.decoder(x, (hidden, cell))
         
         # 取最后一个时间步的输出
-        output = decoder_output[:, -1, :]
+        output = decoder_output  # 逐站点输出
         
         # 输出层
-        output = self.output_layer(output)
+        output = self.output_layer(output).squeeze(-1)
         
         return output
 
@@ -325,7 +342,7 @@ class TFT(nn.Module):
             nn.Linear(32, 1)
         )
         
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         前向传播函数
         
@@ -333,7 +350,7 @@ class TFT(nn.Module):
             x (torch.Tensor): 输入张量，形状为 (batch_size, features) 或 (batch_size, seq_len, features)
             
         Returns:
-            torch.Tensor: 预测结果，形状为 (batch_size, 1)
+            torch.Tensor: 预测结果，形状为 (batch_size, seq_len)，seq_len 为行程站点数
         """
         # 检查输入维度
         if x.dim() == 2:
@@ -353,7 +370,10 @@ class TFT(nn.Module):
         embedded = embedded * gate
         
         # 多头注意力，捕获特征间依赖
-        attn_output, _ = self.attention(embedded, embedded, embedded)
+        attn_key_padding_mask = None
+        if lengths is not None:
+            attn_key_padding_mask = torch.arange(embedded.size(1), device=embedded.device)[None, :] >= lengths.to(embedded.device)[:, None]
+        attn_output, _ = self.attention(embedded, embedded, embedded, key_padding_mask=attn_key_padding_mask)
         attn_output = self.layer_norm1(embedded + attn_output)  # 残差连接 + 层归一化
         
         # 前馈网络
@@ -361,10 +381,10 @@ class TFT(nn.Module):
         ff_output = self.layer_norm2(attn_output + ff_output)  # 残差连接 + 层归一化
         
         # 全局平均池化
-        output = ff_output.mean(dim=1)
+        output = ff_output  # 逐站点输出，不再全局池化
         
         # 输出层
-        output = self.output_layer(output)
+        output = self.output_layer(output).squeeze(-1)
         return output
 
 class EnsembleModel(nn.Module):
@@ -387,7 +407,7 @@ class EnsembleModel(nn.Module):
         self.seq2seq = Seq2SeqPredictor(input_size=input_dim)
         self.tft = TFT(input_dim=input_dim)
         
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         前向传播函数
         
@@ -395,7 +415,7 @@ class EnsembleModel(nn.Module):
             x (torch.Tensor): 输入张量，形状为 (batch_size, features) 或 (batch_size, seq_len, features)
             
         Returns:
-            torch.Tensor: 集成预测结果，形状为 (batch_size, 1)
+            torch.Tensor: 集成预测结果，形状为 (batch_size, seq_len)，seq_len 为行程站点数
         """
         # 检查输入维度
         if x.dim() == 2:
@@ -405,10 +425,10 @@ class EnsembleModel(nn.Module):
             raise ValueError(f"Expected 2D or 3D input, but got {x.dim()}D")
         
         # 各个模型的预测
-        transformer_pred = self.transformer(x)
-        lstm_pred = self.lstm(x)
-        seq2seq_pred = self.seq2seq(x)
-        tft_pred = self.tft(x)
+        transformer_pred = self.transformer(x, lengths)
+        lstm_pred = self.lstm(x, lengths)
+        seq2seq_pred = self.seq2seq(x, lengths)
+        tft_pred = self.tft(x, lengths)
         
         # 简单平均集成
         ensemble_pred = (transformer_pred + lstm_pred + seq2seq_pred + tft_pred) / 4
