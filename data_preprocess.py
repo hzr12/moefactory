@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
+import json
 import pickle
 from sklearn.preprocessing import LabelEncoder
 import torch
@@ -28,9 +29,12 @@ JOURNEY_FEATURES = ['站序', '行程站点数', '站序占比', '是否始发�
 
 
 def _feature_columns(df):
-    """最终特征列 = 基础特征 + 车次编码 + 行程特征 + 天气特征 + 站点距离 embedding。"""
+    """最终特征列 = 基础特征 + 车次编码 + 行程特征 + 天气特征 + 站点距离 embedding
+    + 图邻域特征（拓扑 + 历史 + 邻居嵌入聚合）。"""
     return (list(BASE_FEATURES) + ['车次编码'] + list(JOURNEY_FEATURES)
-            + list(WEATHER_FEATURES) + _station_emb_cols())
+            + list(WEATHER_FEATURES) + _station_emb_cols()
+            + list(GRAPH_TOPO_FEATURES) + list(GRAPH_HIST_FEATURES)
+            + [f'stnb_emb_{i}' for i in range(_STATION_EMB_K)])
 
 
 def _safe_transform(le, values):
@@ -395,6 +399,312 @@ def add_station_embedding_columns(df):
     return df
 
 
+# ---------------------------------------------------------------------------
+# 图邻域特征（拓扑 + 邻居嵌入聚合 + 站点历史延误）
+#   - 拓扑/邻居嵌入来自 network.json + station_embedding.pkl：纯地理属性，零泄漏；
+#   - 站点历史延误在训练路径上严格因果（按日 expanding、shift 1 天，每行只用
+#     严格早于自身日期的标签）；测试路径（无『延误分钟』列）查训练时保存的
+#     graph_hist_state.pkl（每站全期均值），不做任何更新。
+# ---------------------------------------------------------------------------
+GRAPH_TOPO_FEATURES = ['st_deg', 'st_nlines', 'st_nb_dist_mean']
+GRAPH_HIST_FEATURES = ['st_hist_delay', 'stnb_hist_delay']
+
+_NETWORK = None       # {'nb': {站: {邻站: 最小距离km}}, 'nlines': {站: 线路名集合}}
+_HIST_STATE = None    # 测试路径缓存 {'stations': {站: 均值}, 'global': float}
+_HIST_STATE_PATH = './model/graph_hist_state.pkl'
+
+
+def _load_network():
+    """解析 network.json 为邻接表与线路计数（多线重合取最小距离）。"""
+    global _NETWORK
+    if _NETWORK is not None:
+        return _NETWORK
+    net = {'nb': {}, 'nlines': {}}
+    p = './datasets/network.json'
+    if os.path.exists(p):
+        try:
+            with open(p, encoding='utf-8') as f:
+                lines = json.load(f).get('lines', {})
+            for lname, seq in lines.items():
+                for (s1, c1), (s2, c2) in zip(seq, seq[1:]):
+                    try:
+                        w = abs(float(c2) - float(c1))
+                    except (TypeError, ValueError):
+                        continue
+                    if w <= 0:
+                        continue
+                    d = net['nb'].setdefault(s1, {})
+                    if w < d.get(s2, float('inf')):
+                        d[s2] = w
+                    d = net['nb'].setdefault(s2, {})
+                    if w < d.get(s1, float('inf')):
+                        d[s1] = w
+                    net['nlines'].setdefault(s1, set()).add(lname)
+                    net['nlines'].setdefault(s2, set()).add(lname)
+        except Exception as e:
+            print(f"Warning: 解析 network.json 失败，图邻域特征降级为 0: {e}")
+    else:
+        print("Warning: 未找到 datasets/network.json，图邻域特征降级为 0")
+    _NETWORK = net
+    return net
+
+
+def _station_emb_mean():
+    """全表站嵌入均值（站/邻居嵌入缺失时的回退）。"""
+    if _STATION_EMB_K == 0:
+        return None
+    arr = np.array(list(_STATION_EMBEDDING.values()), dtype=float)
+    return arr.mean(axis=0)
+
+
+def _resolve_emb(name, mean_emb):
+    """查站嵌入：原名 → alias → 全表均值。"""
+    if _STATION_EMB_K == 0:
+        return None
+    v = _STATION_EMBEDDING.get(name)
+    if v is None:
+        v = _STATION_EMBEDDING.get(_STATION_EMB_ALIAS.get(name, name))
+    if v is None:
+        v = mean_emb
+    return None if v is None else np.asarray(v, dtype=float)
+
+
+def _add_graph_topology_features(df):
+    """拓扑 3 列（度/线路数/平均邻距）+ 邻居嵌入聚合 stnb_emb_0..K-1
+    （距离反比加权 1/(1+d) 的邻居站嵌入均值）。纯地理，零泄漏。"""
+    net = _load_network()
+    nb = net['nb']
+    K = _STATION_EMB_K
+    mean_emb = _station_emb_mean()
+
+    n = len(df)
+    deg = np.zeros(n)
+    nlin = np.zeros(n)
+    nbd = np.zeros(n)
+    nbmat = np.zeros((n, K)) if K else None
+
+    for idx, s in enumerate(df['车站名'].astype(str)):
+        d = nb.get(s)
+        if d:
+            dists = np.array(list(d.values()), dtype=float)
+            deg[idx] = len(dists)
+            nbd[idx] = dists.mean()
+            ws = 1.0 / (1.0 + dists)
+            if K:
+                vecs = []
+                for j in d:
+                    v = _resolve_emb(j, mean_emb)
+                    vecs.append(v if v is not None else np.zeros(K))
+                nbmat[idx] = (np.vstack(vecs) * ws[:, None]).sum(axis=0) / ws.sum()
+        nlin[idx] = len(net['nlines'].get(s, ()))
+
+    df['st_deg'] = deg
+    df['st_nlines'] = nlin
+    df['st_nb_dist_mean'] = nbd
+    if K:
+        for i in range(K):
+            df[f'stnb_emb_{i}'] = nbmat[:, i]
+    return df
+
+
+def save_graph_hist_state(df, path=None):
+    """训练结束后由 train.py 调用：保存每站全期平均延误与全局均值，
+    供测试路径的 st_hist_delay / stnb_hist_delay 查表使用。"""
+    y = pd.to_numeric(df.get('延误分钟'), errors='coerce')
+    tmp = pd.DataFrame({'s': df['车站名'].astype(str), 'y': y}).dropna()
+    if tmp.empty:
+        return
+    state = {
+        'stations': tmp.groupby('s')['y'].mean().to_dict(),
+        'global': float(tmp['y'].mean()),
+    }
+    p = path or _HIST_STATE_PATH
+    os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+    with open(p, 'wb') as f:
+        pickle.dump(state, f)
+    global _HIST_STATE
+    _HIST_STATE = state
+    print(f"图历史状态已保存: {p}（{len(state['stations'])} 站）")
+
+
+def _load_hist_state():
+    global _HIST_STATE
+    if _HIST_STATE is None:
+        if os.path.exists(_HIST_STATE_PATH):
+            try:
+                with open(_HIST_STATE_PATH, 'rb') as f:
+                    _HIST_STATE = pickle.load(f)
+            except Exception as e:
+                print(f"Warning: 读取 { _HIST_STATE_PATH } 失败: {e}")
+        if not isinstance(_HIST_STATE, dict):
+            _HIST_STATE = {'stations': {}, 'global': 0.0}
+    return _HIST_STATE
+
+
+def _graph_hist_from_state(df):
+    """测试路径：用训练期保存的站均值查表（不更新）。"""
+    state = _load_hist_state()
+    st_map = state.get('stations', {})
+    g = float(state.get('global', 0.0))
+    names = df['车站名'].astype(str)
+    df['st_hist_delay'] = names.map(st_map).astype(float).fillna(g)
+    nb = _load_network()['nb']
+    vals = np.full(len(df), g, dtype=float)
+    for idx, s in enumerate(names):
+        d = nb.get(s)
+        if not d:
+            continue
+        ws = np.array([1.0 / (1.0 + dist) for dist in d.values()])
+        vs = np.array([st_map.get(j, g) for j in d], dtype=float)
+        vals[idx] = float((ws * vs).sum() / ws.sum())
+    df['stnb_hist_delay'] = vals
+    return df
+
+
+def add_graph_hist_features(df):
+    """站点历史延误 2 列（st_hist_delay / stnb_hist_delay）。
+    训练路径严格因果（expanding、shift 1 天）；测试路径查训练期状态。"""
+    y = pd.to_numeric(df.get('延误分钟'), errors='coerce')
+    dt = pd.to_datetime(df.get('到达日期'), errors='coerce')
+    valid = y.notna() & dt.notna()
+
+    if not valid.any():
+        return _graph_hist_from_state(df)
+
+    tmp = pd.DataFrame({'s': df['车站名'].astype(str)[valid].values,
+                        'dt': dt[valid].values,
+                        'y': y[valid].values})
+    daily = tmp.groupby(['s', 'dt'], as_index=False)['y'].mean().sort_values('dt')
+    # 本站历史：严格早于当日的 expanding 均值
+    daily['hist'] = daily.groupby('s')['y'].transform(
+        lambda v: v.shift(1).expanding().mean())
+    gdaily = tmp.groupby('dt', as_index=False)['y'].mean().sort_values('dt')
+    gdaily['ghist'] = gdaily['y'].shift(1).expanding().mean()
+
+    hist_map = dict(zip(zip(daily['s'], daily['dt']), daily['hist']))
+    gh_map = dict(zip(gdaily['dt'], gdaily['ghist']))
+
+    # 邻居历史表：pivot 后按日前向填充（每格本身已是“截至该日前一日”的因果值）
+    pv = daily.pivot(index='dt', columns='s', values='hist').sort_index().ffill()
+    pv_index = pv.index
+    pv_rows = [dict(zip(pv.columns, row)) for row in pv.values]
+    nb = _load_network()['nb']
+
+    n_valid = int(valid.sum())
+    h = np.full(n_valid, np.nan)
+    nh = np.full(n_valid, np.nan)
+    svals = tmp['s'].values
+    tvals = tmp['dt'].values
+    for i in range(n_valid):
+        s, t = svals[i], pd.Timestamp(tvals[i])
+        v = hist_map.get((s, t))
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            v = gh_map.get(t, np.nan)
+        h[i] = v if v is not None and not (isinstance(v, float) and np.isnan(v)) else 0.0
+
+        d = nb.get(s)
+        if not d:
+            nh[i] = h[i]
+            continue
+        k = int(pv_index.searchsorted(t, side='right')) - 1
+        ws, vs = [], []
+        for j, dist in d.items():
+            vj = None
+            if k >= 0:
+                vj = pv_rows[k].get(j)
+            if vj is None or (isinstance(vj, float) and np.isnan(vj)):
+                vj = gh_map.get(t, 0.0)
+            ws.append(1.0 / (1.0 + dist))
+            vs.append(float(vj))
+        ws = np.array(ws)
+        nh[i] = float((np.array(vs) * ws).sum() / ws.sum())
+
+    df['st_hist_delay'] = np.nan
+    df['stnb_hist_delay'] = np.nan
+    df.loc[valid, 'st_hist_delay'] = h
+    df.loc[valid, 'stnb_hist_delay'] = nh
+    df[['st_hist_delay', 'stnb_hist_delay']] = \
+        df[['st_hist_delay', 'stnb_hist_delay']].fillna(0.0)
+    return df
+
+
+def add_graph_features(df):
+    """图邻域特征总入口：拓扑 + 邻居嵌入 + 历史延误（自动按有无标签选路径）。"""
+    _load_station_embedding()
+    df = _add_graph_topology_features(df)
+    df = add_graph_hist_features(df)
+    return df
+
+
+def build_gnn_graph(stations, knn=5):
+    """由训练集车站名列表 + network.json 构建 GNN 图（编码空间）。
+
+    边 = 每站在全网最短路意义下最近的 knn 个训练站（训练站之间常隔着
+    非训练站,直连边过稀,故沿全路网求最短路距离再取 k 近邻）。
+    边权 = 1/(1+最短路距离km),归一化到均值 1。
+
+    返回 (edge_index LongTensor[2,2E] 双向, edge_weight FloatTensor[2,2E],
+    num_nodes)。未知站编码 0 与 0 号站共用节点（与 LabelEncoder 未知→0
+    的约定一致）。需要 scipy。"""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import shortest_path
+
+    nb = _load_network()['nb']
+    nodes = sorted(nb.keys())
+    nidx = {s: i for i, s in enumerate(nodes)}
+
+    rows, cols, ws = [], [], []
+    for s, d in nb.items():
+        i = nidx[s]
+        for j, w in d.items():
+            rows.append(i)
+            cols.append(nidx[j])
+            ws.append(w)
+    G = csr_matrix((ws, (rows, cols)), shape=(len(nodes), len(nodes)))
+
+    sel = [nidx[s] for s in stations if s in nidx]
+    if len(sel) < 2:
+        print("Warning: 训练站几乎不在路网中,GNN 图为空")
+        e = torch.zeros((2, 0), dtype=torch.long)
+        return e, torch.zeros(0), max(len(stations), 1)
+
+    # 只从训练站出发的全网最短路（44×全网）
+    D = shortest_path(G, method='D', directed=False, indices=sel)
+    Dsub = D[:, sel]                      # (N_train, N_train)
+    N = len(sel)
+
+    edges = {}
+    for i in range(N):
+        d = Dsub[i]
+        order = np.argsort(d)
+        cnt = 0
+        for j in order:
+            if j == i:
+                continue
+            dij = d[j]
+            if not np.isfinite(dij):
+                continue
+            key = (min(i, j), max(i, j))
+            if dij < edges.get(key, float('inf')):
+                edges[key] = float(dij)
+            cnt += 1
+            if cnt >= knn:
+                break
+
+    m = len(edges)
+    ei = np.zeros((2, 2 * m), dtype=np.int64)
+    ew = np.zeros(2 * m, dtype=np.float64)
+    for k, ((a, b), w) in enumerate(edges.items()):
+        ei[0, 2 * k], ei[1, 2 * k], ew[2 * k] = a, b, w
+        ei[0, 2 * k + 1], ei[1, 2 * k + 1], ew[2 * k + 1] = b, a, w
+    ww = 1.0 / (1.0 + ew)
+    if ww.size and ww.mean() > 0:
+        ww = ww / ww.mean()
+    print(f"GNN 图构建: {N} 节点 / {m} 条无向边(knn={knn}, 最短路距离)")
+    return (torch.from_numpy(ei), torch.from_numpy(ww.astype(np.float32)),
+            max(len(stations), 1))
+
+
 def _build_feature_frame(df):
     """统一的特征构造流程：过滤损坏记录 -> 行程特征 -> 时间特征 -> 数值化。"""
     df = _drop_invalid_rows(df)
@@ -402,6 +712,7 @@ def _build_feature_frame(df):
     df = extract_time_features(df)
     df = _coerce_weather_numeric(df)
     df = add_station_embedding_columns(df)   # 附加站点距离 embedding
+    df = add_graph_features(df)              # 图邻域特征(拓扑+邻居嵌入+历史延误)
     for c in JOURNEY_FEATURES:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')

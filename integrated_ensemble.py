@@ -6,7 +6,8 @@ import os
 from sklearn.metrics import mean_squared_error
 from data_preprocess import TrainDelayDataset, flatten_sequence_predictions, sequence_row_order
 from torch.utils.data import DataLoader
-from models import TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
+from models import (TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT,
+                    StationGNN, TCNLite, set_gnn_graph)
 
 """
 集成模型模块
@@ -22,35 +23,41 @@ class IntegratedEnsembleModel:
     def __init__(self, input_dim=6):
         """
         初始化集成模型
-        
+
         Args:
             input_dim (int): 输入特征维度
         """
+        self.input_dim = input_dim
+
         # 深度学习模型
         self.transformer_model = TransformerPredictor(input_dim=input_dim)
         self.lstm_model = LSTMPredictor(input_size=input_dim)
         self.seq2seq_model = Seq2SeqPredictor(input_size=input_dim)
         self.tft_model = TFT(input_dim=input_dim)
+        self.stgnn_model = None   # StationGNN（需先注入图,load_models 时构建）
+        self.tcnlite_model = TCNLite(input_dim=input_dim)
         self.dl_ensemble_model = None  # 深度学习集成模型
-        
+
         # 传统机器学习模型
         self.rf_model = None  # 随机森林模型
         self.lgb_model = None  # LightGBM模型
         self.xgb_model = None  # XGBoost模型
         self.cat_model = None  # CatBoost模型
-        
+
         # 模型权重
         self.weights = {
             'transformer': 1.0,
             'lstm': 1.0,
             'seq2seq': 1.0,
             'tft': 1.0,
+            'stgnn': 1.0,
+            'tcnlite': 1.0,
             'rf': 1.0,
             'lgb': 1.0,
             'xgb': 1.0,
             'cat': 1.0
         }
-        
+
         # 设备
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -101,7 +108,34 @@ class IntegratedEnsembleModel:
             print("Successfully loaded TFT model")
         except Exception as e:
             print(f"Failed to load TFT model: {e}")
-            
+
+        # StationGNN:先加载图(邻接/边权),再载入权重
+        try:
+            g = torch.load(f'{model_dir}/station_graph_gnn.pkl', map_location='cpu')
+            set_gnn_graph(g['edge_index'], g['edge_weight'], g['num_nodes'])
+            self.stgnn_model = StationGNN(input_dim=self.input_dim,
+                                          num_nodes=g['num_nodes'])
+            self.stgnn_model.load_state_dict(
+                torch.load(f'{model_dir}/stgnn_best.pth', map_location=self.device)
+            )
+            self.stgnn_model.to(self.device)
+            self.stgnn_model.eval()
+            print("Successfully loaded StationGNN model")
+        except Exception as e:
+            print(f"Failed to load StationGNN model: {e}")
+            self.stgnn_model = None
+
+        try:
+            self.tcnlite_model.load_state_dict(
+                torch.load(f'{model_dir}/tcnlite_best.pth', map_location=self.device)
+            )
+            self.tcnlite_model.to(self.device)
+            self.tcnlite_model.eval()
+            print("Successfully loaded TCN-lite model")
+        except Exception as e:
+            print(f"Failed to load TCN-lite model: {e}")
+            self.tcnlite_model = None
+
         # 加载传统机器学习模型
         try:
             with open(f'{model_dir}/random_forest_best.pkl', 'rb') as f:
@@ -149,7 +183,8 @@ class IntegratedEnsembleModel:
         predictions = {}
 
         candidates = [('transformer', self.transformer_model), ('lstm', self.lstm_model),
-                      ('seq2seq', self.seq2seq_model), ('tft', self.tft_model)]
+                      ('seq2seq', self.seq2seq_model), ('tft', self.tft_model),
+                      ('stgnn', self.stgnn_model), ('tcnlite', self.tcnlite_model)]
         with torch.no_grad():
             for name, model in candidates:
                 if model is None:

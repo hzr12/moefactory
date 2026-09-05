@@ -434,3 +434,114 @@ class EnsembleModel(nn.Module):
         ensemble_pred = (transformer_pred + lstm_pred + seq2seq_pred + tft_pred) / 4
         
         return ensemble_pred
+
+
+# ---------------------------------------------------------------------------
+# 图注入与新增模型(StationGNN / TCN-lite)
+# ---------------------------------------------------------------------------
+
+_GNN_GRAPH = None   # (edge_index LongTensor[2,E], edge_weight FloatTensor[E], num_nodes)
+
+
+def set_gnn_graph(edge_index, edge_weight, num_nodes=None):
+    """注入站点图(由 data_preprocess.build_gnn_graph 构建,train.py 调用)。
+
+    edge_index 为双向边(编码空间,节点=车站编码);未注入图时 StationGNN
+    自动退化为纯序列 MLP,保证任意调用路径下 forward 都能工作。"""
+    global _GNN_GRAPH
+    _GNN_GRAPH = (edge_index, edge_weight, num_nodes)
+
+
+class WeightedGraphConv(nn.Module):
+    """加权图卷积层:h' = LayerNorm(h + Dropout(ReLU(D^-1 · A · h · W)))。
+
+    A 为对称邻接(edge_index 已含双向边),权重=距离反比(构建时归一化到均值1)。
+    自环信息由残差连接提供。"""
+
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.lin = nn.Linear(dim, dim)
+        self.ln = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, h, edge_index, edge_weight):
+        src, dst = edge_index
+        m = self.lin(h[src]) * edge_weight.unsqueeze(-1).to(h.dtype)
+        deg = (torch.zeros(h.size(0), device=h.device, dtype=h.dtype)
+               .index_add_(0, dst, edge_weight.to(h.dtype)).clamp(min=1e-6))
+        agg = torch.zeros_like(h).index_add_(0, dst, m) / deg.unsqueeze(-1)
+        return self.ln(h + self.drop(torch.relu(agg)))
+
+
+class StationGNN(nn.Module):
+    """站点图神经网络:全站可学习节点嵌入经真实铁路网邻接做 2 层消息传递,
+    逐时间步与序列上下文拼接后输出延误。
+
+    - 节点 = 训练集车站(LabelEncoder 编码),边 = network.json 真实相邻区间,
+      边权 = 站间距反比 —— 与 16 维距离站嵌入(静态位置)互补,显式建模
+      “延误沿线路传播”;
+    - 输入特征第 5 列(_feature_columns 顺序)必须是『车站编码』,用于索引节点;
+    - 未注入图时退化为纯序列 MLP。
+    """
+
+    STATION_CODE_COL = 5  # BASE_FEATURES: 出发小时0 出发分钟1 出发月份2 出发日3 出发星期4 车站编码5
+
+    def __init__(self, input_dim=6, hidden_dim=64, num_layers=2, num_nodes=64, dropout=0.2):
+        super().__init__()
+        self.n_features = input_dim
+        self.num_nodes = num_nodes
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.node_emb = nn.Embedding(num_nodes, hidden_dim)
+        nn.init.normal_(self.node_emb.weight, std=0.02)
+        self.convs = nn.ModuleList(
+            [WeightedGraphConv(hidden_dim, dropout) for _ in range(num_layers)])
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64), nn.LayerNorm(64), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(64, 1))
+
+    def forward(self, x, lengths=None):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        ctx = self.input_proj(x)                       # (B, L, H)
+        graph = _GNN_GRAPH
+        if graph is not None:
+            edge_index, edge_weight, _ = graph
+            edge_index = edge_index.to(x.device)
+            edge_weight = edge_weight.to(x.device)
+            h = self.node_emb.weight.to(x.device)
+            for conv in self.convs:
+                h = conv(h, edge_index, edge_weight)   # (N, H)
+            code = x[..., self.STATION_CODE_COL].long().clamp(0, h.size(0) - 1)
+            g = h[code]                                # (B, L, H)
+        else:
+            g = torch.zeros_like(ctx)
+        z = torch.cat([ctx, g], dim=-1)
+        return self.head(z).squeeze(-1)                # (B, L)
+
+
+class TCNLite(nn.Module):
+    """轻量因果卷积序列模型:2 层 dilated Conv1d(k=3, dilation=1/2)+ 残差,
+    逐站输出。参数量 ~20k,与 LSTM/Transformer 形成不同归纳偏置,
+    小数据下为集成提供多样性。"""
+
+    def __init__(self, input_dim=6, hidden_dim=48, kernel_size=3, dropout=0.2):
+        super().__init__()
+        self.n_features = input_dim
+        self.kernel_size = kernel_size
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, dilation=1)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, dilation=2)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 1))
+
+    def forward(self, x, lengths=None):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        h = self.input_proj(x).transpose(1, 2)         # (B, H, L)
+        k = self.kernel_size
+        L = h.size(-1)
+        h1 = torch.relu(self.conv1(nn.functional.pad(h, (k - 1, 0))))[..., :L]
+        h2 = torch.relu(self.conv2(nn.functional.pad(self.drop(h1), (2 * (k - 1), 0))))[..., :L]
+        z = (h1 + h2).transpose(1, 2)                  # (B, L, H) 残差
+        return self.head(z).squeeze(-1)                # (B, L)

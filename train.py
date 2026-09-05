@@ -10,8 +10,10 @@ from tqdm import tqdm
 
 from data_preprocess import (load_train_data, encode_categorical_features, prepare_train_data,
                              TrainDelayDataset, split_by_date, prepare_sequence_data,
-                             split_sequence_by_date, JourneySequenceDataset, MaskedMSELoss)
-from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
+                             split_sequence_by_date, JourneySequenceDataset, MaskedMSELoss,
+                             build_gnn_graph, save_graph_hist_state)
+from models import (EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT,
+                    StationGNN, TCNLite, set_gnn_graph)
 
 """
 模型训练脚本
@@ -217,95 +219,125 @@ def main():
     """
     主函数，负责整个训练流程
     """
+    parser = argparse.ArgumentParser(description='训练延误预测模型')
+    parser.add_argument('--skip-ml', action='store_true',
+                        help='跳过 4 个传统机器学习模型(RF/LGB/XGB/CatBoost)')
+    parser.add_argument('--epochs', type=int, default=500, help='DL 训练轮数')
+    args = parser.parse_args()
+
     # 创建必要的目录
     os.makedirs('./model', exist_ok=True)
-    
+
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    
+
     # 加载数据
     print("Loading training data...")
     train_df = load_train_data('./datasets/train')
     print(f"Loaded {len(train_df)} training samples")
-    
+
     # 编码分类特征
     train_df, label_encoder = encode_categorical_features(train_df)
-    
+
     # 准备训练数据
     X, y = prepare_train_data(train_df)
-    
+
     # 检查是否有NaN值并处理
     print(f"X shape: {X.shape}, y shape: {y.shape}")
     print(f"NaN in X: {np.isnan(X).sum()}, NaN in y: {np.isnan(y).sum()}")
-    
+
     # 处理NaN值
     X = np.nan_to_num(X, nan=0.0)
     y = np.nan_to_num(y, nan=0.0)
-    
+
     # 按“到达日期”分组留出验证集：避免同一天的行分到两侧，导致按天常量的天气特征变成日期指纹
     X_train, X_val, y_train, y_val, val_start, val_end = split_by_date(train_df, X, y, val_ratio=0.1)
     print(f"训练集: {len(X_train)} 行 / 验证集: {len(X_val)} 行")
     print(f"验证集日期范围: {str(val_start)[:10]} ~ {str(val_end)[:10]}")
-    
-    # 训练传统机器学习模型
-    train_traditional_models(X_train, y_train, X_val, y_val)
-    
+
+    # 训练传统机器学习模型（--skip-ml 可跳过）
+    if not args.skip_ml:
+        train_traditional_models(X_train, y_train, X_val, y_val)
+    else:
+        print("跳过传统机器学习模型 (--skip-ml)")
+
     # 创建数据集和数据加载器
     # 深度学习模型改用“行程序列”输入：一趟车沿途各站构成一个时间步
     seq = prepare_sequence_data(train_df)
     seq_train, seq_val, seq_start, seq_end = split_sequence_by_date(seq, 0.1)
     print(f"行程序列: {seq['X'].shape[0]} 个行程，最长 {seq['X'].shape[1]} 站")
     print(f"序列验证集日期范围: {str(seq_start)[:10]} ~ {str(seq_end)[:10]}")
-    
+
     train_loader = DataLoader(JourneySequenceDataset(seq_train), batch_size=32, shuffle=True)
     val_loader = DataLoader(JourneySequenceDataset(seq_val), batch_size=32, shuffle=False)
-    
+
     # 模型参数
     input_dim = seq['X'].shape[2]
-    num_epochs = 500  # 训练轮数
+    num_epochs = args.epochs
     learning_rate = 0.001
-    
+
     print(f"Input dimension: {input_dim}")
-    
+
+    # 构建站点图并注入 StationGNN（真实铁路网邻接，边权=距离反比）
+    stations = list(label_encoder.classes_)
+    edge_index, edge_weight, num_nodes = build_gnn_graph(stations)
+    set_gnn_graph(edge_index, edge_weight, num_nodes)
+    torch.save({'edge_index': edge_index, 'edge_weight': edge_weight,
+                'num_nodes': num_nodes}, './model/station_graph_gnn.pkl')
+
     # 定义损失函数（只在真实站点上计算，忽略 padding）
     criterion = MaskedMSELoss()
-    
+
     # 训练集成模型
     print("Training Ensemble Model...")
     ensemble_model = EnsembleModel(input_dim=input_dim)
     ensemble_optimizer = optim.Adam(ensemble_model.parameters(), lr=learning_rate, weight_decay=1e-5)
     ensemble_scheduler = optim.lr_scheduler.ReduceLROnPlateau(ensemble_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(ensemble_model, train_loader, val_loader, criterion, ensemble_optimizer, ensemble_scheduler, num_epochs, device, "ensemble")
-    
+
     # 训练Transformer模型
     print("Training Transformer Model...")
     transformer_model = TransformerPredictor(input_dim=input_dim)
     transformer_optimizer = optim.Adam(transformer_model.parameters(), lr=learning_rate, weight_decay=1e-5)
     transformer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(transformer_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(transformer_model, train_loader, val_loader, criterion, transformer_optimizer, transformer_scheduler, num_epochs, device, "transformer")
-    
+
     # 训练LSTM模型
     print("Training LSTM Model...")
     lstm_model = LSTMPredictor(input_size=input_dim)
     lstm_optimizer = optim.Adam(lstm_model.parameters(), lr=learning_rate, weight_decay=1e-5)
     lstm_scheduler = optim.lr_scheduler.ReduceLROnPlateau(lstm_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(lstm_model, train_loader, val_loader, criterion, lstm_optimizer, lstm_scheduler, num_epochs, device, "lstm")
-    
+
     # 训练Seq2Seq模型
     print("Training Seq2Seq Model...")
     seq2seq_model = Seq2SeqPredictor(input_size=input_dim)
     seq2seq_optimizer = optim.Adam(seq2seq_model.parameters(), lr=learning_rate, weight_decay=1e-5)
     seq2seq_scheduler = optim.lr_scheduler.ReduceLROnPlateau(seq2seq_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(seq2seq_model, train_loader, val_loader, criterion, seq2seq_optimizer, seq2seq_scheduler, num_epochs, device, "seq2seq")
-    
+
     # 训练TFT模型
     print("Training TFT Model...")
     tft_model = TFT(input_dim=input_dim)
     tft_optimizer = optim.Adam(tft_model.parameters(), lr=learning_rate, weight_decay=1e-5)
     tft_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tft_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
     train_model(tft_model, train_loader, val_loader, criterion, tft_optimizer, tft_scheduler, num_epochs, device, "tft")
-    
+
+    # 训练StationGNN（图神经网络：延误沿铁路网传播）
+    print("Training StationGNN Model...")
+    stgnn_model = StationGNN(input_dim=input_dim, num_nodes=num_nodes)
+    stgnn_optimizer = optim.Adam(stgnn_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    stgnn_scheduler = optim.lr_scheduler.ReduceLROnPlateau(stgnn_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
+    train_model(stgnn_model, train_loader, val_loader, criterion, stgnn_optimizer, stgnn_scheduler, num_epochs, device, "stgnn")
+
+    # 训练TCN-lite（轻量因果卷积，提供集成多样性）
+    print("Training TCN-lite Model...")
+    tcn_model = TCNLite(input_dim=input_dim)
+    tcn_optimizer = optim.Adam(tcn_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    tcn_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tcn_optimizer, mode='min', patience=10, factor=0.9, min_lr=1e-5)
+    train_model(tcn_model, train_loader, val_loader, criterion, tcn_optimizer, tcn_scheduler, num_epochs, device, "tcnlite")
+
     # 保存标签编码器（车站 + 车次）
     import pickle
     with open('./model/label_encoder.pkl', 'wb') as f:
@@ -314,6 +346,9 @@ def main():
     if encoders.get('train') is not None:
         with open('./model/train_label_encoder.pkl', 'wb') as f:
             pickle.dump(encoders['train'], f)
+
+    # 保存站点历史延误状态（供预测路径的图历史特征查表）
+    save_graph_hist_state(train_df)
 
     print("Training completed!")
 
