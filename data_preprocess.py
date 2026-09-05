@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
+import pickle
 from sklearn.preprocessing import LabelEncoder
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -27,8 +28,9 @@ JOURNEY_FEATURES = ['站序', '行程站点数', '站序占比', '是否始发�
 
 
 def _feature_columns(df):
-    """最终特征列 = 基础特征 + 车次编码 + 行程特征 + 天气特征。"""
-    return list(BASE_FEATURES) + ['车次编码'] + list(JOURNEY_FEATURES) + list(WEATHER_FEATURES)
+    """最终特征列 = 基础特征 + 车次编码 + 行程特征 + 天气特征 + 站点距离 embedding。"""
+    return (list(BASE_FEATURES) + ['车次编码'] + list(JOURNEY_FEATURES)
+            + list(WEATHER_FEATURES) + _station_emb_cols())
 
 
 def _safe_transform(le, values):
@@ -289,12 +291,117 @@ def add_journey_features(df):
     return df
 
 
+# ---------------------------------------------------------------------------
+# 站点距离 embedding（由 fetch_jprailfan_mileage.py + build_station_embedding.py 生成）
+# 基于 jprailfan 线路详情页的“每站累计里程”构造站间距矩阵，MDS 降维得到连续向量。
+# 若 model/station_embedding.pkl 不存在，则本模块完全无操作（向后兼容）。
+# ---------------------------------------------------------------------------
+_STATION_EMBEDDING = None   # 懒加载缓存；{} 表示已尝试加载但无数据
+_STATION_EMB_K = 0
+# 我们的数据站名 ↔ jprailfan 站名（京广高铁技术性起点为北京丰台，km=0）
+_STATION_EMB_ALIAS = {"北京西": "北京丰台", "北京": "北京丰台"}
+
+
+def _load_station_embedding():
+    """懒加载 station_embedding.pkl；缺失则置为 {}（不再重试）。"""
+    global _STATION_EMBEDDING, _STATION_EMB_K
+    if _STATION_EMBEDDING is not None:
+        return
+    pkl = "./model/station_embedding.pkl"
+    if not os.path.exists(pkl):
+        _STATION_EMBEDDING = {}
+        return
+    with open(pkl, "rb") as f:
+        data = pickle.load(f)
+    if data:
+        _STATION_EMBEDDING = data
+        _STATION_EMB_K = len(next(iter(data.values())))
+    else:
+        _STATION_EMBEDDING = {}
+
+
+def _station_emb_cols():
+    """返回的列名（st_emb_0..K-1）；无 embedding 时为空列表。"""
+    return [f"st_emb_{i}" for i in range(_STATION_EMB_K)]
+
+
+_STATION_EMB_MEAN = None   # OOV 终极回退用的全表均值向量缓存（算一次）
+_STATION_CITY_INDEX = None # 城市级回退索引: 前缀 -> [站名...]
+_STATION_CITY_VEC = {}     # 前缀 -> 城市均值向量缓存
+_CITY_PREFIX_LENS = (5, 4, 3, 2)
+
+
+def _build_city_index():
+    """由已知站名自动聚类“城市”：共享前缀且 ≥2 站的集合
+    （如 郑州东/郑州南/郑州航空港 -> “郑州”）。纯站名统计，无需维护城市字典。
+    前缀长度 5>4>3>2 优先匹配，长名城市(乌鲁木齐/呼和浩特)不会被短前缀误并。"""
+    global _STATION_CITY_INDEX
+    if _STATION_CITY_INDEX is not None:
+        return
+    from collections import defaultdict
+    buckets = defaultdict(set)
+    for nm in _STATION_EMBEDDING:
+        for L in _CITY_PREFIX_LENS:
+            if len(nm) >= L:
+                buckets[nm[:L]].add(nm)
+    _STATION_CITY_INDEX = {p: sorted(v) for p, v in buckets.items() if len(v) >= 2}
+
+
+def _city_fallback(name):
+    """OOV 站的城市级回退：按最长前缀匹配城市，返回该城市所有站的均值向量；
+    未命中返回 None（由调用方继续回退到全表均值）。"""
+    if _STATION_EMB_K == 0:
+        return None
+    _build_city_index()
+    nm = name[:-1] if name.endswith("站") else name
+    for L in _CITY_PREFIX_LENS:
+        if len(nm) >= L:
+            grp = _STATION_CITY_INDEX.get(nm[:L])
+            if grp:
+                vec = _STATION_CITY_VEC.get(nm[:L])
+                if vec is None:
+                    arr = np.array([_STATION_EMBEDDING[s] for s in grp], dtype=float)
+                    vec = arr.mean(axis=0)
+                    _STATION_CITY_VEC[nm[:L]] = vec
+                return vec
+    return None
+
+
+def _station_embedding_vector(name):
+    """返回 K 维向量；未知站先按城市级回退（最长前缀，缓存），再回退到全表均值。"""
+    key = _STATION_EMB_ALIAS.get(name, name)
+    if key in _STATION_EMBEDDING:
+        return np.asarray(_STATION_EMBEDDING[key], dtype=float)
+    vec = _city_fallback(key)
+    if vec is not None:
+        return vec
+    global _STATION_EMB_MEAN
+    if _STATION_EMB_MEAN is None:
+        arr = np.array(list(_STATION_EMBEDDING.values()), dtype=float)
+        _STATION_EMB_MEAN = arr.mean(axis=0)
+    return _STATION_EMB_MEAN
+
+
+def add_station_embedding_columns(df):
+    """在 df 上附加 st_emb_0..K-1 列；无 embedding 文件则原样返回。"""
+    _load_station_embedding()
+    if _STATION_EMB_K == 0:
+        return df
+    cols = _station_emb_cols()
+    vecs = df["车站名"].astype(str).apply(_station_embedding_vector)
+    emb_mat = np.vstack([np.asarray(v, dtype=float) for v in vecs])
+    for i, c in enumerate(cols):
+        df[c] = emb_mat[:, i]
+    return df
+
+
 def _build_feature_frame(df):
     """统一的特征构造流程：过滤损坏记录 -> 行程特征 -> 时间特征 -> 数值化。"""
     df = _drop_invalid_rows(df)
     df = add_journey_features(df)
     df = extract_time_features(df)
     df = _coerce_weather_numeric(df)
+    df = add_station_embedding_columns(df)   # 附加站点距离 embedding
     for c in JOURNEY_FEATURES:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
