@@ -6,7 +6,9 @@ import pickle
 import argparse
 import glob
 
-from data_preprocess import load_test_data, encode_categorical_features, prepare_test_data, load_train_data
+from data_preprocess import (load_test_data, encode_categorical_features, prepare_test_data,
+                             load_train_data, prepare_sequence_data, JourneySequenceDataset,
+                             flatten_sequence_predictions)
 from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
 
 """
@@ -67,13 +69,13 @@ def predict_with_model(model, test_loader, device):
     Returns:
         numpy.ndarray: 预测结果数组
     """
-    predictions = []
+    chunks = []
     with torch.no_grad():
-        for inputs in test_loader:
-            inputs = inputs[0].to(device)  # 从tuple中提取tensor
-            outputs = model(inputs)
-            predictions.extend(outputs.cpu().numpy())
-    return np.array(predictions).flatten()
+        for inputs, _targets, lengths in test_loader:
+            inputs, lengths = inputs.to(device), lengths.to(device)
+            outputs = model(inputs, lengths)
+            chunks.append(outputs.cpu().numpy())
+    return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 0))
 
 def predict_with_traditional_model(model, X_test):
     """
@@ -175,13 +177,13 @@ def process_single_file(test_file, train_df, device):
     print(f"Test data shape: {X_test.shape}")
     print(f"NaN in test data: {np.isnan(X_test).sum()}")
     
-    # 创建测试数据加载器
-    from torch.utils.data import DataLoader, TensorDataset
-    test_dataset = TensorDataset(torch.FloatTensor(X_test))
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    # 深度学习模型改用“行程序列”输入（一趟车沿途各站为一个时间步）
+    seq_test = prepare_sequence_data(test_df_encoded)
+    from torch.utils.data import DataLoader
+    test_loader = DataLoader(JourneySequenceDataset(seq_test), batch_size=32, shuffle=False)
     
     # 输入维度
-    input_dim = X_test.shape[1]
+    input_dim = seq_test['X'].shape[2]
     
     # 加载模型并进行预测
     predictions = {}
@@ -241,7 +243,7 @@ def process_single_file(test_file, train_df, device):
     if os.path.exists(ensemble_model_path):
         ensemble_model = load_trained_model(ensemble_model, ensemble_model_path, device)
         if ensemble_model is not None:
-            ensemble_preds = predict_with_model(ensemble_model, test_loader, device)
+            ensemble_preds = flatten_sequence_predictions(predict_with_model(ensemble_model, test_loader, device), seq_test)
             predictions['ensemble'] = ensemble_preds
             save_predictions(test_df, ensemble_preds, 'ensemble', test_file_name)
     else:
@@ -254,7 +256,7 @@ def process_single_file(test_file, train_df, device):
     if os.path.exists(transformer_model_path):
         transformer_model = load_trained_model(transformer_model, transformer_model_path, device)
         if transformer_model is not None:
-            transformer_preds = predict_with_model(transformer_model, test_loader, device)
+            transformer_preds = flatten_sequence_predictions(predict_with_model(transformer_model, test_loader, device), seq_test)
             predictions['transformer'] = transformer_preds
             save_predictions(test_df, transformer_preds, 'transformer', test_file_name)
     else:
@@ -267,7 +269,7 @@ def process_single_file(test_file, train_df, device):
     if os.path.exists(lstm_model_path):
         lstm_model = load_trained_model(lstm_model, lstm_model_path, device)
         if lstm_model is not None:
-            lstm_preds = predict_with_model(lstm_model, test_loader, device)
+            lstm_preds = flatten_sequence_predictions(predict_with_model(lstm_model, test_loader, device), seq_test)
             predictions['lstm'] = lstm_preds
             save_predictions(test_df, lstm_preds, 'lstm', test_file_name)
     else:
@@ -280,7 +282,7 @@ def process_single_file(test_file, train_df, device):
     if os.path.exists(seq2seq_model_path):
         seq2seq_model = load_trained_model(seq2seq_model, seq2seq_model_path, device)
         if seq2seq_model is not None:
-            seq2seq_preds = predict_with_model(seq2seq_model, test_loader, device)
+            seq2seq_preds = flatten_sequence_predictions(predict_with_model(seq2seq_model, test_loader, device), seq_test)
             predictions['seq2seq'] = seq2seq_preds
             save_predictions(test_df, seq2seq_preds, 'seq2seq', test_file_name)
     else:
@@ -293,7 +295,7 @@ def process_single_file(test_file, train_df, device):
     if os.path.exists(tft_model_path):
         tft_model = load_trained_model(tft_model, tft_model_path, device)
         if tft_model is not None:
-            tft_preds = predict_with_model(tft_model, test_loader, device)
+            tft_preds = flatten_sequence_predictions(predict_with_model(tft_model, test_loader, device), seq_test)
             predictions['tft'] = tft_preds
             save_predictions(test_df, tft_preds, 'tft', test_file_name)
     else:

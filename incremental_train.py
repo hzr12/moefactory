@@ -9,7 +9,9 @@ import argparse
 from tqdm import tqdm
 import pickle
 
-from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, TrainDelayDataset, split_by_date
+from data_preprocess import (load_train_data, encode_categorical_features, prepare_train_data,
+                             TrainDelayDataset, split_by_date, prepare_sequence_data,
+                             split_sequence_by_date, JourneySequenceDataset, MaskedMSELoss)
 from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor
 
 #增量学习
@@ -59,12 +61,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         train_samples = 0
 
         # 遍历训练数据，不显示进度条
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for inputs, targets, lengths in train_loader:
+            inputs, targets, lengths = inputs.to(device), targets.to(device), lengths.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs = model(inputs, lengths)
+            loss = criterion(outputs, targets, lengths)
 
             # 检查损失是否为NaN
             if torch.isnan(loss):
@@ -78,7 +80,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
             optimizer.step()
             train_loss += loss.item() * inputs.size(0)
-            train_samples += inputs.size(0)
+            train_samples += int(lengths.sum())
 
         # 计算平均训练损失
         avg_train_loss = train_loss / train_samples if train_samples > 0 else 0
@@ -90,16 +92,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
         # 遍历验证数据，不显示进度条
         with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+            for inputs, targets, lengths in val_loader:
+                inputs, targets, lengths = inputs.to(device), targets.to(device), lengths.to(device)
+                outputs = model(inputs, lengths)
+                loss = criterion(outputs, targets, lengths)
                 # 检查损失是否为NaN
                 if torch.isnan(loss):
                     print(f"Warning: NaN validation loss encountered in {model_name} at epoch {epoch + 1}")
                     continue
                 val_loss += loss.item() * inputs.size(0)
-                val_samples += inputs.size(0)
+                val_samples += int(lengths.sum())
 
         # 计算平均验证损失
         avg_val_loss = val_loss / val_samples if val_samples > 0 else 0
@@ -335,21 +337,23 @@ def main():
     train_traditional_models(X_train, y_train, X_val, y_val)
 
     # 创建数据集和数据加载器
-    train_dataset = TrainDelayDataset(X_train, y_train)
-    val_dataset = TrainDelayDataset(X_val, y_val)
+    # 深度学习模型同样改用“行程序列”输入
+    seq = prepare_sequence_data(incremental_train_df)
+    seq_train, seq_val, seq_start, seq_end = split_sequence_by_date(seq, 0.1)
+    print(f"行程序列: {seq['X'].shape[0]} 个行程，最长 {seq['X'].shape[1]} 站")
 
-    train_loader = DataLoader(train_dataset, batch_size=17, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=17, shuffle=False)
+    train_loader = DataLoader(JourneySequenceDataset(seq_train), batch_size=32, shuffle=True)
+    val_loader = DataLoader(JourneySequenceDataset(seq_val), batch_size=32, shuffle=False)
 
     # 模型参数
-    input_dim = X_train.shape[1]
+    input_dim = seq['X'].shape[2]
     num_epochs = 200  # 减少训练轮数以适应增量学习
     learning_rate = 0.0001  # 使用较小的学习率进行微调
 
     print(f"Input dimension: {input_dim}")
 
-    # 定义损失函数
-    criterion = nn.MSELoss()
+    # 定义损失函数（只在真实站点上计算，忽略 padding）
+    criterion = MaskedMSELoss()
 
     # 训练集成模型
     print("Incremental Training Ensemble Model...")

@@ -37,6 +37,31 @@ def _safe_transform(le, values):
     return [mapping.get(v, 0) for v in values]
 
 
+class JourneySequenceDataset(Dataset):
+    """行程序列数据集：返回 (特征序列, 目标序列, 真实站点数)。
+
+    一趟车沿途各站构成一个时间步，循环/注意力模型因此能真正利用时序结构。
+    """
+    def __init__(self, seq):
+        self.X = torch.FloatTensor(seq['X'])
+        self.y = torch.FloatTensor(seq['y'])
+        self.lengths = torch.LongTensor(seq['lengths'])
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx], self.lengths[idx]
+
+
+class MaskedMSELoss(torch.nn.Module):
+    """只在真实站点（非 padding）上计算 MSE。"""
+    def forward(self, pred, target, lengths):
+        mask = torch.arange(pred.size(1), device=pred.device)[None, :] < lengths.to(pred.device)[:, None]
+        diff = (pred - target) ** 2
+        return (diff * mask).sum() / mask.sum().clamp(min=1)
+
+
 class TrainDelayDataset(Dataset):
     """
     列车延误数据集类
@@ -77,6 +102,19 @@ class TrainDelayDataset(Dataset):
         else:
             return torch.FloatTensor(self.data[idx])
 
+def _drop_invalid_rows(df, require_target=False):
+    """丢弃无法使用的记录。
+
+    缺少车次ID的行无法归入任何行程，会让扁平特征与行程序列的行错位；
+    训练时还要求延误分钟（目标值）存在，否则会被当成 0 参与训练。
+    """
+    tid = df['车次ID'].astype(str).str.strip()
+    df = df[tid.notna() & (tid != '') & (tid != 'nan') & (tid != 'None')]
+    if require_target and '延误分钟' in df.columns:
+        df = df[pd.to_numeric(df['延误分钟'], errors='coerce').notna()]
+    return df.reset_index(drop=True)
+
+
 def load_train_data(train_dir):
     """
     加载训练数据
@@ -85,7 +123,7 @@ def load_train_data(train_dir):
         train_dir (str): 训练数据目录路径
         
     Returns:
-        pandas.DataFrame: 合并后的训练数据
+        pandas.DataFrame: 合并后的训练数据（已剔除车次ID/延误分钟缺失的损坏记录）
     """
     all_data = []
     
@@ -98,7 +136,7 @@ def load_train_data(train_dir):
     
     # 合并所有数据
     combined_df = pd.concat(all_data, ignore_index=True)
-    return combined_df
+    return _drop_invalid_rows(combined_df, require_target=True)
 
 def load_test_data(test_file):
     """
@@ -108,10 +146,10 @@ def load_test_data(test_file):
         test_file (str): 测试数据文件路径
         
     Returns:
-        pandas.DataFrame: 测试数据
+        pandas.DataFrame: 测试数据（已剔除车次ID缺失的记录）
     """
     df = pd.read_csv(test_file)
-    return df
+    return _drop_invalid_rows(df)
 
 def extract_time_features(df, is_train=True):
     """
@@ -252,7 +290,8 @@ def add_journey_features(df):
 
 
 def _build_feature_frame(df):
-    """统一的特征构造流程：行程特征 -> 时间特征 -> 数值化。"""
+    """统一的特征构造流程：过滤损坏记录 -> 行程特征 -> 时间特征 -> 数值化。"""
+    df = _drop_invalid_rows(df)
     df = add_journey_features(df)
     df = extract_time_features(df)
     df = _coerce_weather_numeric(df)
@@ -381,10 +420,21 @@ def split_sequence_by_date(seq, val_ratio=0.1):
 
 
 def flatten_sequence_predictions(preds, seq):
-    """把 (n_journeys, max_len) 的序列预测还原成按原始行顺序排列的一维数组。"""
+    """把 (n_journeys, max_len) 的序列预测摊平成“按原始行号排列”的一维数组。
+
+    数组长度取覆盖到的最大行号 + 1（未覆盖的行为 0），因此既适用于全量数据，
+    也适用于按日期切出的子集；子集场景用 sequence_row_order() 取回对应行即可。
+    """
     preds = np.asarray(preds).reshape(-1)
     row_pos = np.asarray(seq['row_pos']).reshape(-1)
     mask = row_pos >= 0
-    out = np.zeros(int(mask.sum()), dtype=float)
+    n = int(row_pos[mask].max()) + 1 if mask.any() else 0
+    out = np.zeros(n, dtype=float)
     out[row_pos[mask]] = preds[mask]
     return out
+
+
+def sequence_row_order(seq):
+    """返回序列数据覆盖的原始行号（升序），用于从摊平结果中取回子集。"""
+    row_pos = np.asarray(seq['row_pos']).reshape(-1)
+    return np.sort(row_pos[row_pos >= 0])

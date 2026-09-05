@@ -8,7 +8,9 @@ import os
 import argparse
 from tqdm import tqdm
 
-from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, TrainDelayDataset, split_by_date
+from data_preprocess import (load_train_data, encode_categorical_features, prepare_train_data,
+                             TrainDelayDataset, split_by_date, prepare_sequence_data,
+                             split_sequence_by_date, JourneySequenceDataset, MaskedMSELoss)
 from models import EnsembleModel, TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
 
 """
@@ -50,12 +52,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         train_samples = 0
 
         # 遍历训练数据，不显示进度条
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for inputs, targets, lengths in train_loader:
+            inputs, targets, lengths = inputs.to(device), targets.to(device), lengths.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs = model(inputs, lengths)
+            loss = criterion(outputs, targets, lengths)
 
             # 检查损失是否为NaN
             if torch.isnan(loss):
@@ -69,7 +71,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
             optimizer.step()
             train_loss += loss.item() * inputs.size(0)
-            train_samples += inputs.size(0)
+            train_samples += int(lengths.sum())
 
         # 计算平均训练损失
         avg_train_loss = train_loss / train_samples if train_samples > 0 else 0
@@ -81,16 +83,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
         # 遍历验证数据，不显示进度条
         with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+            for inputs, targets, lengths in val_loader:
+                inputs, targets, lengths = inputs.to(device), targets.to(device), lengths.to(device)
+                outputs = model(inputs, lengths)
+                loss = criterion(outputs, targets, lengths)
                 # 检查损失是否为NaN
                 if torch.isnan(loss):
                     print(f"Warning: NaN validation loss encountered in {model_name} at epoch {epoch + 1}")
                     continue
                 val_loss += loss.item() * inputs.size(0)
-                val_samples += inputs.size(0)
+                val_samples += int(lengths.sum())
 
         # 计算平均验证损失
         avg_val_loss = val_loss / val_samples if val_samples > 0 else 0
@@ -126,15 +128,23 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     return model
 
 
+def _load_best_params():
+    """读取 tune_models.py 搜索得到的最优参数（若存在），否则返回空字典。"""
+    import json
+    p = './model/best_params.json'
+    if os.path.exists(p):
+        try:
+            with open(p, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: 无法读取最优参数 {p}: {e}")
+    return {}
+
+
 def train_traditional_models(X_train, y_train, X_val, y_val):
     """
-    训练传统机器学习模型
-    
-    Args:
-        X_train (numpy.ndarray): 训练特征
-        y_train (numpy.ndarray): 训练目标值
-        X_val (numpy.ndarray): 验证特征
-        y_val (numpy.ndarray): 验证目标值
+    训练传统机器学习模型（Random Forest, LightGBM, XGBoost, CatBoost）。
+    若 model/best_params.json 存在，则用其中的超参数覆盖默认配置（由 tune_models.py 产出）。
     """
     try:
         from sklearn.ensemble import RandomForestRegressor
@@ -143,85 +153,62 @@ def train_traditional_models(X_train, y_train, X_val, y_val):
         from catboost import CatBoostRegressor
         from sklearn.metrics import mean_squared_error
         import pickle
-        
+
+        best = _load_best_params()
+
+        # 默认配置（被调参证实合理的起点）；best_params.json 中的值会覆盖它们
+        rf_defaults = dict(n_estimators=1000, max_depth=10, min_samples_split=5,
+                           min_samples_leaf=2, n_jobs=-1, random_state=3461)
+        lgb_defaults = dict(num_leaves=63, learning_rate=0.01, n_estimators=500, verbose=-1, random_state=3461)
+        # XGBoost 必须用温和的学习率 + 子采样/列采样 + L2 正则，否则在 4000+ 样本上严重过拟合
+        xgb_defaults = dict(n_estimators=800, max_depth=6, learning_rate=0.02, subsample=0.8,
+                            colsample_bytree=0.8, reg_lambda=5, min_child_weight=5,
+                            tree_method='hist', random_state=3461)
+        cat_defaults = dict(iterations=1000, depth=6, learning_rate=0.1, verbose=False, random_state=3461)
+
+        rf_params = {**rf_defaults, **best.get('random_forest', {})}
+        lgb_params = {**lgb_defaults, **best.get('lightgbm', {})}
+        xgb_params = {**xgb_defaults, **best.get('xgboost', {})}
+        cat_params = {**cat_defaults, **best.get('catboost', {})}
+        if best:
+            print(f"已载入 tune_models.py 的最优参数，覆盖模型: {list(best.keys())}")
+
         # 训练随机森林模型
         print("Training Random Forest Model...")
-        rf_model = RandomForestRegressor(
-            n_estimators=1000,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            n_jobs=-1,
-            random_state=3461
-        )
+        rf_model = RandomForestRegressor(**rf_params)
         rf_model.fit(X_train, y_train)
-        
-        # 验证随机森林模型
-        rf_pred = rf_model.predict(X_val)
-        rf_mse = mean_squared_error(y_val, rf_pred)
+        rf_mse = mean_squared_error(y_val, rf_model.predict(X_val))
         print(f"Random Forest Val MSE: {rf_mse:.4f}")
-        
-        # 保存随机森林模型
         with open('./model/random_forest_best.pkl', 'wb') as f:
             pickle.dump(rf_model, f)
-        
+
         # 训练LightGBM模型
         print("Training LightGBM Model...")
-        lgb_model = LGBMRegressor(
-            num_leaves=63,
-            learning_rate=0.01,
-            n_estimators=500
-        )
+        lgb_model = LGBMRegressor(**lgb_params)
         lgb_model.fit(X_train, y_train)
-        
-        # 验证LightGBM模型
-        lgb_pred = lgb_model.predict(X_val)
-        lgb_mse = mean_squared_error(y_val, lgb_pred)
+        lgb_mse = mean_squared_error(y_val, lgb_model.predict(X_val))
         print(f"LightGBM Val MSE: {lgb_mse:.4f}")
-        
-        # 保存LightGBM模型
         with open('./model/lightgbm_best.pkl', 'wb') as f:
             pickle.dump(lgb_model, f)
-            
+
         # 训练XGBoost模型
         print("Training XGBoost Model...")
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=3461
-        )
+        xgb_model = XGBRegressor(**xgb_params)
         xgb_model.fit(X_train, y_train)
-        
-        # 验证XGBoost模型
-        xgb_pred = xgb_model.predict(X_val)
-        xgb_mse = mean_squared_error(y_val, xgb_pred)
+        xgb_mse = mean_squared_error(y_val, xgb_model.predict(X_val))
         print(f"XGBoost Val MSE: {xgb_mse:.4f}")
-        
-        # 保存XGBoost模型
         with open('./model/xgboost_best.pkl', 'wb') as f:
             pickle.dump(xgb_model, f)
-            
+
         # 训练CatBoost模型
         print("Training CatBoost Model...")
-        cat_model = CatBoostRegressor(
-            iterations=1000,
-            depth=6,
-            learning_rate=0.1,
-            verbose=False,
-            random_state=3461
-        )
+        cat_model = CatBoostRegressor(**cat_params)
         cat_model.fit(X_train, y_train)
-        
-        # 验证CatBoost模型
-        cat_pred = cat_model.predict(X_val)
-        cat_mse = mean_squared_error(y_val, cat_pred)
+        cat_mse = mean_squared_error(y_val, cat_model.predict(X_val))
         print(f"CatBoost Val MSE: {cat_mse:.4f}")
-        
-        # 保存CatBoost模型
         with open('./model/catboost_best.pkl', 'wb') as f:
             pickle.dump(cat_model, f)
-            
+
     except ImportError as e:
         print(f"Warning: Could not import traditional ML libraries: {e}")
         print("Skipping traditional ML model training...")
@@ -265,21 +252,24 @@ def main():
     train_traditional_models(X_train, y_train, X_val, y_val)
     
     # 创建数据集和数据加载器
-    train_dataset = TrainDelayDataset(X_train, y_train)
-    val_dataset = TrainDelayDataset(X_val, y_val)
+    # 深度学习模型改用“行程序列”输入：一趟车沿途各站构成一个时间步
+    seq = prepare_sequence_data(train_df)
+    seq_train, seq_val, seq_start, seq_end = split_sequence_by_date(seq, 0.1)
+    print(f"行程序列: {seq['X'].shape[0]} 个行程，最长 {seq['X'].shape[1]} 站")
+    print(f"序列验证集日期范围: {str(seq_start)[:10]} ~ {str(seq_end)[:10]}")
     
-    train_loader = DataLoader(train_dataset, batch_size=17, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=17, shuffle=False)
+    train_loader = DataLoader(JourneySequenceDataset(seq_train), batch_size=32, shuffle=True)
+    val_loader = DataLoader(JourneySequenceDataset(seq_val), batch_size=32, shuffle=False)
     
     # 模型参数
-    input_dim = X_train.shape[1]
+    input_dim = seq['X'].shape[2]
     num_epochs = 500  # 训练轮数
     learning_rate = 0.001
     
     print(f"Input dimension: {input_dim}")
     
-    # 定义损失函数
-    criterion = nn.MSELoss()
+    # 定义损失函数（只在真实站点上计算，忽略 padding）
+    criterion = MaskedMSELoss()
     
     # 训练集成模型
     print("Training Ensemble Model...")

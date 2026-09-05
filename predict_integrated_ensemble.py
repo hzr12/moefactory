@@ -4,7 +4,8 @@ import numpy as np
 import os
 import pickle
 import glob
-from data_preprocess import load_test_data, encode_categorical_features, prepare_test_data, load_train_data
+from data_preprocess import (load_test_data, encode_categorical_features, prepare_test_data,
+                             load_train_data, prepare_sequence_data)
 from integrated_ensemble import IntegratedEnsembleModel
 
 def load_model_info(model_info_path):
@@ -81,9 +82,12 @@ def process_single_file(test_file, train_df, model_info=None):
                 ensemble_model.weights = model_info.get('weights', ensemble_model.weights)
                 print(f"Loaded dynamic weights from file: {ensemble_model.weights}")
     
+    # 深度学习模型使用行程序列输入
+    seq_test = prepare_sequence_data(test_df_encoded)
+
     # 进行预测
     print("Predicting with Integrated Ensemble Model...")
-    predictions = ensemble_model.predict(X_test)
+    predictions = ensemble_model.predict(X_test, seq_test['X'], seq_test['lengths'], seq_test['row_pos'])
     
     # 保存预测结果
     save_predictions(test_df, predictions, test_file_name)

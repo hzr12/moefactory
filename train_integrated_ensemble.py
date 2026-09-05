@@ -4,7 +4,8 @@ import os
 import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-from data_preprocess import load_train_data, encode_categorical_features, prepare_train_data, split_by_date
+from data_preprocess import (load_train_data, encode_categorical_features, prepare_train_data,
+                             split_by_date, prepare_sequence_data, split_sequence_by_date)
 from integrated_ensemble import IntegratedEnsembleModel
 
 def train_integrated_ensemble():
@@ -50,8 +51,13 @@ def train_integrated_ensemble():
     print("Loading pre-trained models...")
     ensemble_model.load_models('./model')
     
+    # 深度学习模型需要行程序列输入，与扁平验证集使用同一批留出日期
+    seq = prepare_sequence_data(train_df)
+    _seq_train, seq_val, seq_start, seq_end = split_sequence_by_date(seq, 0.2)
+    print(f"序列验证集日期范围: {str(seq_start)[:10]} ~ {str(seq_end)[:10]}")
+
     # 计算动态权重
-    weights = ensemble_model.calculate_weights(X_val, y_val)
+    weights = ensemble_model.calculate_weights(X_val, y_val, seq_val['X'], seq_val['lengths'], seq_val['row_pos'])
     
     # 保存模型信息（包括权重）
     ensemble_model.save_model_info('./model/integrated_ensemble_info.pkl')

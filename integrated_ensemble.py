@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 import os
 from sklearn.metrics import mean_squared_error
-from data_preprocess import TrainDelayDataset
+from data_preprocess import TrainDelayDataset, flatten_sequence_predictions, sequence_row_order
 from torch.utils.data import DataLoader
 from models import TransformerPredictor, LSTMPredictor, Seq2SeqPredictor, TFT
 
@@ -131,73 +131,40 @@ class IntegratedEnsembleModel:
         except Exception as e:
             print(f"Failed to load CatBoost model: {e}")
     
-    def predict_dl_models(self, X):
+    def predict_dl_models(self, X_seq, lengths, row_pos, n_rows):
         """
-        使用深度学习模型进行预测
-        
+        使用深度学习模型在“行程序列”上预测，并还原成按原始行排列的结果
+
         Args:
-            X (numpy.ndarray): 输入特征
-            
+            X_seq: (n_journeys, max_len, n_features) 序列特征
+            lengths: 每个行程的真实站点数
+            row_pos: 每个时间步对应的原始行位置
+            n_rows: 原始数据行数
+
         Returns:
-            dict: 各深度学习模型的预测结果
+            dict: 各深度学习模型的预测结果（按原始行顺序）
         """
-        # 创建数据加载器
-        dataset = TrainDelayDataset(X, np.zeros(len(X)))  # 只需要输入，不需要标签
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
-        
-        # 存储预测结果
-        transformer_preds = []
-        lstm_preds = []
-        seq2seq_preds = []
-        tft_preds = []
-        
+        inputs = torch.FloatTensor(X_seq).to(self.device)
+        lens = torch.LongTensor(lengths).to(self.device)
+        predictions = {}
+
+        candidates = [('transformer', self.transformer_model), ('lstm', self.lstm_model),
+                      ('seq2seq', self.seq2seq_model), ('tft', self.tft_model)]
         with torch.no_grad():
-            for inputs, _ in dataloader:
-                inputs = inputs.to(self.device)
-                
-                # Transformer预测
-                if hasattr(self, 'transformer_model') and self.transformer_model is not None:
-                    try:
-                        pred = self.transformer_model(inputs)
-                        transformer_preds.extend(pred.cpu().numpy().flatten())
-                    except Exception as e:
-                        print(f"Error in Transformer prediction: {e}")
-                        transformer_preds.extend([0] * inputs.size(0))
-                
-                # LSTM预测
-                if hasattr(self, 'lstm_model') and self.lstm_model is not None:
-                    try:
-                        pred = self.lstm_model(inputs)
-                        lstm_preds.extend(pred.cpu().numpy().flatten())
-                    except Exception as e:
-                        print(f"Error in LSTM prediction: {e}")
-                        lstm_preds.extend([0] * inputs.size(0))
-                
-                # Seq2Seq预测
-                if hasattr(self, 'seq2seq_model') and self.seq2seq_model is not None:
-                    try:
-                        pred = self.seq2seq_model(inputs)
-                        seq2seq_preds.extend(pred.cpu().numpy().flatten())
-                    except Exception as e:
-                        print(f"Error in Seq2Seq prediction: {e}")
-                        seq2seq_preds.extend([0] * inputs.size(0))
-                
-                # TFT预测
-                if hasattr(self, 'tft_model') and self.tft_model is not None:
-                    try:
-                        pred = self.tft_model(inputs)
-                        tft_preds.extend(pred.cpu().numpy().flatten())
-                    except Exception as e:
-                        print(f"Error in TFT prediction: {e}")
-                        tft_preds.extend([0] * inputs.size(0))
-        
-        return {
-            'transformer': np.array(transformer_preds),
-            'lstm': np.array(lstm_preds),
-            'seq2seq': np.array(seq2seq_preds),
-            'tft': np.array(tft_preds)
-        }
-    
+            for name, model in candidates:
+                if model is None:
+                    continue
+                try:
+                    pred = model(inputs, lens).cpu().numpy()
+                    # 摊平后按行号取回与 X_flat 对应的子集（行序一致）
+                    pred_by_row = flatten_sequence_predictions(pred, {'row_pos': row_pos})
+                    predictions[name] = pred_by_row[sequence_row_order({'row_pos': row_pos})]
+                except Exception as e:
+                    print(f"Error in {name} prediction: {e}")
+                    predictions[name] = np.zeros(n_rows)
+
+        return predictions
+
     def predict_ml_models(self, X):
         """
         使用传统机器学习模型进行预测
@@ -244,28 +211,23 @@ class IntegratedEnsembleModel:
         
         return predictions
     
-    def calculate_weights(self, X_val, y_val):
+    def calculate_weights(self, X_val_flat, y_val, X_val_seq=None, lengths=None, row_pos=None):
         """
         根据验证集表现动态计算模型权重
-        
-        Args:
-            X_val (numpy.ndarray): 验证集特征
-            y_val (numpy.ndarray): 验证集目标值
-            
-        Returns:
-            dict: 各模型的权重
         """
         print("Calculating dynamic weights based on validation performance...")
-        
-        # 获取深度学习模型预测
-        dl_predictions = self.predict_dl_models(X_val)
-        
+
+        # 获取深度学习模型预测（行程序列）
+        dl_predictions = {}
+        if X_val_seq is not None and row_pos is not None:
+            dl_predictions = self.predict_dl_models(X_val_seq, lengths, row_pos, len(X_val_flat))
+
         # 获取传统机器学习模型预测
-        ml_predictions = self.predict_ml_models(X_val)
-        
+        ml_predictions = self.predict_ml_models(X_val_flat)
+
         # 合并所有预测
         all_predictions = {**dl_predictions, **ml_predictions}
-        
+
         # 计算每个模型的MSE（越小越好）
         model_mse = {}
         for model_name, preds in all_predictions.items():
@@ -275,65 +237,70 @@ class IntegratedEnsembleModel:
                 print(f"{model_name} MSE: {mse:.4f}")
             else:
                 print(f"Skipping {model_name} due to prediction length mismatch")
-        
+
         # 计算权重（MSE的倒数作为基础权重）
         weights = {}
         total_weight = 0
-        
+
         for model_name, mse in model_mse.items():
             # 使用MSE的倒数作为基础权重，加一个小常数防止除零
             weight = 1.0 / (mse + 1e-8)
             weights[model_name] = weight
             total_weight += weight
-        
+
         # 归一化权重，使总和为1
         if total_weight > 0:
             for model_name in weights:
                 weights[model_name] = weights[model_name] / total_weight
-        
+
         self.weights = weights
         print(f"Calculated weights: {self.weights}")
         return self.weights
-    
-    def predict(self, X):
+
+    def predict(self, X_flat, X_seq=None, lengths=None, row_pos=None):
         """
         使用集成模型进行预测
-        
+
         Args:
-            X (numpy.ndarray): 输入特征
-            
+            X_flat: 扁平特征，供传统机器学习模型使用
+            X_seq / lengths / row_pos: 行程序列，供深度学习模型使用（可缺省）
+
         Returns:
             numpy.ndarray: 集成预测结果
         """
+        n_rows = len(X_flat)
+
         # 获取深度学习模型预测
-        dl_predictions = self.predict_dl_models(X)
-        
+        dl_predictions = {}
+        if X_seq is not None and row_pos is not None:
+            dl_predictions = self.predict_dl_models(X_seq, lengths, row_pos, n_rows)
+
         # 获取传统机器学习模型预测
-        ml_predictions = self.predict_ml_models(X)
-        
+        ml_predictions = self.predict_ml_models(X_flat)
+
         # 合并所有预测
         all_predictions = {**dl_predictions, **ml_predictions}
-        
+
         # 使用权重进行加权平均
-        weighted_predictions = np.zeros(len(X))
+        weighted_predictions = np.zeros(n_rows)
         total_weight = 0
-        
+
         for model_name, preds in all_predictions.items():
-            if model_name in self.weights and len(preds) == len(X):
+            if model_name in self.weights and len(preds) == n_rows:
                 weight = self.weights[model_name]
                 weighted_predictions += weight * preds
                 total_weight += weight
                 print(f"Applied {model_name} with weight {weight:.4f}")
             else:
                 print(f"Skipping {model_name} in final prediction")
-        
+
         # 归一化（如果总权重不为1）
         if total_weight > 0 and abs(total_weight - 1.0) > 1e-6:
             weighted_predictions = weighted_predictions / total_weight
             print(f"Normalized predictions by total weight: {total_weight:.4f}")
-        
+
         return weighted_predictions
-    
+
     def save_model_info(self, filepath):
         """
         保存模型信息（权重等）
